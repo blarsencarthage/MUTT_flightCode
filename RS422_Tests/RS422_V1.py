@@ -41,23 +41,23 @@ ACTIVATION = b"START"
 # The signal to watch for. Replace with your real pattern. Examples:
 
 
-def on_activation():
+def onActivation():
     """Called once per detected activation signal. Put your action here."""
     log.info(">>> Activation signal detected -- triggering action.")
     # e.g. set a flag, launch a process, toggle an output, enqueue an event...
  
  
-def open_port():
+def openPort():
     return serial.Serial(
         port=PORT, baudrate=BAUD, bytesize=BYTESIZE,
         parity=PARITY, stopbits=STOPBITS, timeout=READ_TIMEOUT,
     )
  
-# Called by listen() scans the buffer for activation pattern, calls on_activation() when pattern is found
+# Called by listen() scans the buffer for activation pattern, calls onActivation() when pattern is found
 def scan(buffer: bytearray):
     idx = buffer.find(ACTIVATION)
     while idx != -1:
-        on_activation()
+        onActivation()
         del buffer[:idx + len(ACTIVATION)]   # drop through end of the match
         idx = buffer.find(ACTIVATION)
  
@@ -73,7 +73,7 @@ def listen():
     while True:
         ser = None
         try:
-            ser = open_port()
+            ser = openPort()
             ser.reset_input_buffer()
             buffer.clear()
             log.info("Listening on %s @ %d baud", PORT, BAUD)
