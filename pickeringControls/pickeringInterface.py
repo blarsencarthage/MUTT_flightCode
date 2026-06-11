@@ -41,7 +41,7 @@ def initPXIE():
     return cards
 
 
-def updateWaveform(card,channel, frequency, amplitude, offset):
+def updateWaveform(card, channel, frequency, amplitude, offset, phase=0.0):
     if card is None:
         print("No card available.")
         return
@@ -50,11 +50,12 @@ def updateWaveform(card,channel, frequency, amplitude, offset):
         card.PILFG_SetWaveform(channel, pilpxi.FG_WfTypes.PILFG_WAVEFORM_SINE)
         card.PILFG_SetAmplitude(channel, amplitude)
         card.PILFG_SetFrequency(channel, frequency)
-        if offset < -5 or offset > 5:
-            print("Offset voltage must be between -5 and 5 volts.")
+        if offset < 0 or offset > 5:
+            print("Offset voltage must be between 0 and 5 volts.")
             card.PILFG_SetDcOffset(channel, 0)
         else:
             card.PILFG_SetDcOffset(channel, offset)
+        card.PILFG_SetStartPhase(channel, phase % 360.0)
         card.PILFG_InitiateGeneration(channel)
     except pilpxi.Error as error:
         print("Exception occurred:", error.message)
