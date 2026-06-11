@@ -1,0 +1,487 @@
+# Python wrapper library for Pickering PXI Direct-IO driver #
+
+Python Pilpxi is a Python wrapper for Pickering PXI Direct-IO driver. It supports both Python 2.x and 3.x.
+
+----------
+# Change Log #
+
+- 1.7 - Added PILFG functions. Support for new 41-625.
+- 1.61 - Updated readme and project description.
+- 1.6 - Adds SetAttributeDWORDArray and GetAttributeDWORDArray.
+- 1.51 - Fixes NonPrecisionResistor example.
+- 1.5 - Adds ResSetResistance() optional mode parameter, and mode value enum
+- 1.4 - Updates with calibration functions 
+- 1.3 - Updates readme with migration guide, adds card.cardInfo structure 
+- 1.2 - Further battery simulator updates, including set-measure-set functionality, measurement configuration. 
+- 1.1 - Updates and improves resolver and battery simulator functionality, updates to relevant example code, bug fixes and improvements
+- 1.0  - Changes to API to add more object oriented features, exceptions, support for new DIO and Current Loop simulator cards.
+- 0.98 - Updates to use native strings in Python 2.x and 3.x. `decode()` workaround no longer necessary in Python 3. 
+- 0.97 - Adds Thermocouple Functions and SetCrosspointRange
+- 0.96 - Fixes SetAttenuation call
+- 0.95 - Fixes ResInfo call
+- 0.94 - Fixes Battery Current Functions
+- 0.93 - Refactor for use with pip installer
+
+----------
+# Installation instructions #
+
+We provide both a python module that can be installed to the system using `pip` and can be added manually to a project by copying a file into the directory that you are working in. For either installation method please make sure that you have installed Pickering PXI Installer Package. This can be found at the following addresses:
+
+ - [PXI Installer Package](http://pickeringtest.info/downloads/drivers/PXI_Drivers/)
+
+----------
+## Install Using `pip` ##
+
+To install Python Pilpxi using pip open a command line prompt and navigate to the directory the driver has been extracted to. From there enter the following command:
+```
+pip install .
+```
+
+----------
+## Install Manually ##
+
+To install Python Pilpxi manually please copy the `pilpxi` module from the extracted directory to your working directory.
+
+----------
+# Using Pilpxi #
+
+Pilpxi can be used to control our 40/50 series pickering products.
+
+## List cards ##
+
+To get a count of available cards IDs use `CountFreeCards()`. This will return the total card count. To list the bus and slot number for all of the cards use `FindFreeCards()`. Please see below for worked examples on how to use both of these functions:
+
+```python
+import pilpxi
+
+# Connect to chassis
+base = pilpxi.Base()
+
+# Get number of Card IDs for cards in chassis
+card_count = base.CountFreeCards()
+# Get list of tuples containing Bus and Device numbers
+devices = base.FindFreeCards()
+
+# The number of cards present can be found from the length of the list of devices
+print("Card count: ", len(devices))
+```
+
+## Open Card ##
+
+Cards are opened when the `Pi_Card` constructor is called. It takes bus and slot numbers in a tuple as parameters as shown below: 
+
+```python
+import pilpxi
+
+bus = 2
+device = 5
+
+# Takes a tuple containing bus and device numbers
+card = pilpxi.Pi_Card(bus, device)
+```
+
+## Operate Switching cards ##
+
+There are three main types of switching cards:
+    - Switches
+    - Multiplexer
+    - Matrix
+
+To operate Switches and Multiplexers use `OpBit()` providing subunit, switch point, and switch state. Matrices can be controller using `OpCrosspoint()` which requires the subunit, row, column, and switch state. Please see below for worked examples on using these functions:
+
+```python
+# Control Switches and Multiplex cards
+subunit = 1
+switchpoint = 1
+try:
+    # Close switch at switchpoint
+    card.OpBit(subunit, switchpoint, 1)
+
+    # Open switch at switchpoint
+    card.OpBit(subunit, switchpoint, 0)
+except pilpxi.Error as ex: 
+    print("Error: ", ex.message)
+
+
+# Control Matrix cards
+row = 1
+column = 1
+
+try:
+    # Connect crosspoint at row, column
+    card.OpCrosspoint(subunit, row, column, 1)
+
+    # Disconnect crosspoint at x, y
+    card.OpCrosspoint(subunit, row, column, 0)
+
+except pilpxi.Error as ex: 
+    print("Error: ", ex.message)
+```
+### Using Subunit States ### 
+
+The Python-Pilpxi wrapper contains methods to read entire subunit states, e.g. the current switch configuration of a switching or matrix card, manipulate these states and apply the state back to the card in one single operation. This means, for example, multiple crosspoints can be connected at once, or the user may have multiple desired matrix/switch states and alternate between them. 
+
+Example for manipulating matrix card states:
+```python
+# Get an object representing the current state of the specified matrix subunit:
+subState = card.GetSubState(subunit)
+
+# Set matrix crosspoints 1, 1 and 2, 2 on the subunit state;
+# No actual switching occurs yet.
+subState.PreSetCrosspoint(1, 1, True)
+subState.PreSetCrosspoint(2, 2, True)
+
+# Apply the subunit state.
+# Crosspoints changed will now be applied to the physical card. 
+card.WriteSubState(subunit, subState)
+```
+Example for manipulating switching card states:
+```python
+# Get an object representing the current state of the specified switch subunit:
+subState = card.GetSubState(subunit)
+
+# Set switches 1 and 2 on the subunit state;
+# No actual switching occurs yet.
+subState.PreSetBit(1, True)
+subState.PreSetBit(2, True)
+
+# Apply the subunit state.
+# Switches changed will now be applied to the physical card. 
+card.WriteSubState(subunit, subState)
+```
+It is also possible to obtain a subunit state object representing a blank subunit:
+```python
+blankSubunitState = card.GetBlankSubState(subunit)
+```
+
+
+## Operate Resistor Cards ##
+
+Resistor cards come in two varieties: Programmable Resistor, and Precision Resistor. Programmable Resistors are controlled like Switch Cards shown above. Precision Resistor Cards have specific resistor functions. To set a resistance `ResSetResistance` is used and to get the current resistance `ResGetResistance` is used as shown below:
+
+```python
+# Set Resistance of given subunit
+import pilpxi
+
+resistance = 330.0
+
+try:
+    card.ResSetResistance(subunit, resistance)
+
+except pilpxi.Error as ex:
+    print("Error: ", ex.message)
+
+# Retrive current resistance of given subunit
+try:
+    resistance = card.ResGetResistance(subunit)
+    print("Resistance: ", resistance)
+
+except pilpxi.Error as ex:
+    print("Error: ", ex.message)
+
+# Set Resistance with specific mode:
+#    RES_Mode.SET                     # Legacy/Default mode to support existing break before make with settling delay
+#    RES_Mode.MBB                     # New mode to suport make before break with settling delay
+#    RES_Mode.APPLY_PATTERN_IMMEDIATE # Apply new pattern immediately and wait till settling delay
+#    RES_Mode.NO_SETTLING_DELAY       # Disable settling delay,same as DriverMode NO_WAIT, but at sub-unit level
+#    RES_Mode.DONT_SET                # Do the calculations but don't set the card
+
+# Set using make-before-break mode 
+try:
+    
+    resistance = card.ResSetResistance(subunit, resistance, mode=pilpxi.RES_Mode.MBB)
+
+except pilpxi.Error as ex:
+    print("Error: ", ex.message)
+```
+
+## Operate Attenuator ##
+
+Attenuators have specific functions for controlling them. To set attenuation use `SetAttenuation()` providing the subunit and attenuation expressed in decibels. To retrieve the current attenuation use `GetAttenuation()` giving the subunit. It returns the attenuation expressed in decibels. Please see below for worked examples on how to use these functions:
+
+```python
+# Setting Attenuation
+attenuation = 1.5     # Attenuation in dB
+try:
+    card.SetAttenuation(subunit, attenuation)
+
+except pilpxi.Error as ex: 
+    print("Error: ", ex.message)
+
+# Retrieving Attenuation
+try:
+    attenuation = card.GetAttenuation(subunit)
+    print("Attenuation (dB): ", attenuation)
+
+except pilpxi.Error as ex: 
+    print("Error: ", ex.message)
+```
+
+## Operate Power Supply ##
+
+Power Supplies have specific functions for controlling them. To set voltage use `PsuSetVoltage()` providing the subunit and voltage. To retrieve voltage use `PsuGetVoltage()` giving the subunit. It returns the set voltage. To enable output use `PsuEnable` providing the subunit and the state to be set. Please see below for worked examples on how to use these functions:
+
+```python
+try:
+    # Set Voltage
+    volts = 3.3
+    card.PsuSetVoltage(subunit, volts)
+
+
+    # Enable output
+    card.PsuEnable(subunit, 1)
+
+
+    # Get Voltage
+    volts = card.PsuGetVoltage(subunit)
+
+
+    # Disable output
+    card.PsuEnable(subunit, 0)
+
+except pilpxi.Error as ex: 
+    print("Error: ", ex.message)
+```
+
+## Operate Battery Simulator ##
+
+Battery Simulators have specific functions for controlling them. To set voltage use `BattSetVoltage()` providing the subunit and voltage. To retrieve the set voltage use `BattGetVoltage()` giving the subunit. To set current use `BattSetcurrent()` providing the subunit and current. To retrieve the set current use `BattGetcurrent()` giving the subunit. It returns the set current. To enable output use `BattSetEnable()` providing the subunit and the state to be set. To retrieve the present output state use `BattGetEnable()`. It returns the state. On supported battery simulator cards, `BattMeasureVoltage()` and `BattMeasureCurrentmA()` functions are available to measure live actual voltage and current values from the card's output. Please see below for worked examples on how to use these functions:
+
+```python
+volts = 3.3
+currrent = 0.5
+
+try:
+    # Set Voltage
+    card.BattSetVoltage(subunit, volts)
+
+    # Set Current
+    card.BattSetCurrent(subunit, current)
+
+    # Enable Output
+    card.BattSetEnable(subunit, 1)
+
+    # Check interlock state 
+    interlock = card.BattReadInterlockState(subunit)
+
+    # Get Voltage
+    volts = card.BattGetVoltage(subunit)
+
+    # Set Current
+    current = card.BattGetCurrent(subunit)
+
+    # Get Output state
+    state = card.BattGetEnable(subunit)
+
+except pilpxi.Error as ex:
+    print("Error operating battery simulator: {}".format(ex.message))
+    print("Error code: {}".format(ex.errorCode))
+```
+If you attempt to enable the outputs of a battery simulator card without the hardware interlock, `BattSetEnable()` will throw an exception (error code 70, hardware interlock error). Therefore it is important to call functions in a `try` block and handle errors appropriately.
+
+### 41-752A-01x functionality 
+
+The 41-752A-01x battery simulator cards have extra capabilities beyond what is supported by other cards. Please consult your manual for information on your product's capabilities. Worked examples on using the extra functionality are below:
+
+```python
+try:
+    # The following functionality is not supported by all battery simulator
+    # cards. Please consult your product manual for information on your card's 
+    # functionality. 
+
+    # Enable set-measure-set mode (increases measurement accuracy on supported cards)
+    card.BattSetMeasureSet(subunit, True)
+
+    # Configure measurement mode to alter device accuracy/sampling: 
+    numSamples                  = pilpxi.BattNumSamples.SAMPLES_128     # Average values after 128 samples
+    VConversionTimePerSample    = pilpxi.BattConversionTime.T_1052us    # 1052 us voltage sample time
+    IConversionTimePerSample    = pilpxi.BattConversionTime.T_540us     # 540 us current sample time
+    triggerMode                 = pilpxi.BattOperationMode.CONTINUOUS   # Measure continuously (no wait for trigger)
+
+    card.BattSetMeasureConfig(subunit, numSamples, VConversionTimePerSample, IConversionTimePerSample, triggerMode)
+
+    # The battery simulator (41-752A-01x) has the capability to take into consideration the load
+    # at which the voltage must be provided. Calculated data for voltage at different loads are
+    # used to provide this functionality.
+    load = 100  # units: mA
+    card.BattSetLoad(subunit, load)
+
+    # Measure channel voltage
+    voltage = card.BattMeasureVoltage(subunit)
+
+    # Measure channel current (in milliamps)
+    currentmA = card.BattMeasureCurrentmA(subunit)
+
+    # Measure channel current (in amps)
+    current = card.BattMeasureCurrentA(subunit)
+
+except pilpxi.Error as ex: 
+    print("Error operating special battery simulator functions: ", ex.message)
+    print("Error code: {}".format(ex.errorCode))
+```
+
+## Operate Thermocouple Simulator ##
+
+Thermocouple Simulators have specific functions for controlling them. To set the range use `VsourceSetRange()` providing the subunit and the range. To retrieve the range use `VsourceGetRange()` providing the subunit. It returns the range. To set the voltage use `VsourceSetVoltage()` providing the subunit and the voltage in millivolts. To retrieve the voltage use `VsourceGetVoltage()` providing the subunit. It returns the voltage in millivolts. To enable or disable outputs use `OpBit()` providing the subunit, bit number for the channel isolations, and the state that should be set. To retrieve the state of the outputs use `ViewBit()` providing the subunit and bit number for the channel isolations. It returns the state of the requsted bit. Please refer to the product manual for more information on what subunit and bits to operate. To retrieve temperature readings from a connected thermocouple compensation block us `VsourceGetTemperatures()` providing either `pilpxi.Attributes.TS_TEMPERATURES_C` or `pilpxi.Attributes.TS_TEMPERATURES_F` for temperature unit. It will return a list of four temperatures. Please see below for worked examples on how to use these functions:
+
+```python
+range = 0.0
+mvolts = 0.0
+
+try:
+    # Set Range
+    range = pilpxi.TS_Range.AUTO
+    card.VsourceSetRange(subunit, range)
+
+    # Get Range
+    range = card.VsourceGetRange(subunit)
+
+    # Set Voltage
+    card.VsourceSetVoltage(subunit, mvolts)
+
+    # Get Voltage
+    mvolts = card.VsourceGetVoltage(subunit)
+
+except pilpxi.Error as ex: 
+    print("Error: ", ex.message)
+
+# Set Isolation switches (41-760-001)
+try: 
+    isosub = 33
+    card.OpBit(isosub, 1, 1) # Turn Vo1 on
+    card.OpBit(isosub, 2, 1) # Turn Vcold1 on
+
+    card.OpBit(isosub, 1, 0) # Turn Vo1 off
+    card.OpBit(isosub, 2, 0) # Turn Vcold1 off
+
+except pilpxi.Error as ex: 
+    print("Error: ", ex.message)
+
+# Get a dict containing Thermocouple subunit information
+vsourceInfoDict = card.VsourceInfo(subunit)
+
+# Get Compensation Block Temperatures
+temperatures = card.VsourceGetTemperature(pilpxi.Attributes.TS_TEMPERATURES_C)
+
+for temp in temperatures:
+    print(temp)
+
+```
+
+## Error handling ##
+
+Most of the functions in Pilpxi will raise an exception on errors. To handle `pilpxi.Error` exceptions and obtain error messages and (optionally) an error code from the driver: 
+
+```python
+try:
+    # Call pilpxi functionality here
+
+except pilpxi.Error as ex: 
+    ErrorMessage = ex.message
+    DriverErrorCode = ex.errorCode
+
+    print("Error {code} occured: {message}".format(code=DriverErrorCode, message=ErrorMessage))
+```
+## Close Cards ##
+
+A card should be closed when it is no longer being used. To close a card `CloseSpecifiedCard` is used as shown below:
+
+```python
+card.Close()     # Closes individual card
+```
+
+## Migrating from old versions of the Python Pilpxi wrapper ## 
+
+From wrapper version 1.0 onwards, major changes were made to the Python pilpxi wrapper API. Most notably, opening/listing cards and error handling conventions have changed. The new wrapper does not rely on returning an integer error code from every method, as is conventional in a C program. Instead. Python-style exceptions are raised, and the exception contains attributes giving the integer error code, and a human-readable description of the error.
+
+### Old wrapper example: ### 
+
+```python
+from pilpxi import *
+
+# Connect to card at bus 8 device 14
+bus = 8
+device = 14
+
+# No error checking is possible at this point because Python constructors only return 
+# a class instance 
+card = pilpxi_card(bus, device) 
+
+# Close and then open crosspoint X1, Y1 on subunit 1 (matrix subunit)
+
+subunit = 1
+row = 1
+column = 2
+state = 1
+
+err = card.OpCrosspoint(subunit, row, column, state)
+
+# Check the error code. Note that strings must be decoded (Python 3.x only)
+if err:
+    message = card.ErrorMessage(err)
+    print("Error ocurred: " message.decode())
+    exit()
+
+state = 0
+
+err = card.OpCrosspoint(subunit, row, column, state)
+
+if err:
+    message = card.ErrorMessage(err)
+    print("Error ocurred: " message.decode())
+    exit()
+
+card.CloseSpecifiedCard()
+```
+
+### New wrapper example: ### 
+
+```python
+import pilpxi 
+
+try:
+    # Connect to card at bus 8 device 14
+    bus = 8
+    device = 14
+
+    card = pilpxi.Pi_Card(bus, device)
+
+except pilpxi.Error as ex:
+    print("Error occurred opening card: ", ex.message)
+    exit()
+
+try:
+    # Close and then open crosspoint X1, Y1 on subunit 1 (matrix subunit)
+
+    subunit = 1
+    row = 1
+    column = 2
+    state = True # Can be True, False or 1, 0 
+
+    card.OpCrosspoint(subunit, row, column, state)
+
+    state = False 
+
+    card.OpCrosspoint(subunit, row, column, state)
+
+except pilpxi.Error as ex:
+    print("Error occurred closing crosspoint: ", ex.message)
+    exit()
+
+# Close card. Will be called automatically when card object is garbage collected. 
+card.Close()
+```
+
+Function signatures remain largely identical between versions of the wrapper, except error codes are not returned. Therefore, previously a function returning a value would also return an error code:
+
+```python
+error, resistance = card.ResGetResistance(subunit)
+```
+
+Would now become:
+
+```python
+resistance = card.ResGetResistance(subunit)
+```
+
+Errors would be caught in a try/except block.

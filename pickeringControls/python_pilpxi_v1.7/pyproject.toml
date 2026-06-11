@@ -1,0 +1,15 @@
+[project]
+name = "Pilpxi"
+version = "1.7"
+description = "Python wrapper library for Pickering PXI Direct-IO driver"
+readme = "README.md"
+license = {file = "LICENSE.txt"}
+authors = [
+    {name = "Pickering Interfaces", email = "support@pickeringtest.com"}
+]
+dependencies = [
+    "enum34"
+]
+
+[project.urls]
+homepage = "https://downloads.pickeringtest.info/downloads/drivers/PXI_Drivers/"
