@@ -46,7 +46,6 @@ def updateWaveform(card, channel, frequency, amplitude, offset, phase=0.0):
         print("No card available.")
         return
     try:
-        card.PILFG_AbortGeneration(channel)
         card.PILFG_SetWaveform(channel, pilpxi.FG_WfTypes.PILFG_WAVEFORM_SINE)
         card.PILFG_SetAmplitude(channel, amplitude)
         card.PILFG_SetFrequency(channel, frequency)

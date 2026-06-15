@@ -32,21 +32,21 @@ CHANNEL_MAP = {
 PAIR_COLORS = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948"]
 
 # Normalized (x, y) in [0,1]² for each of the 12 transducers.
-# Arranged in a 2-3-4-3 diamond hex pattern (rows top → bottom).
+# Arranged in a 2-4-4-2 diamond hex pattern (rows top → bottom).
 TRANSDUCER_XY = [
     # Row 0 — 2 elements
     (0.38, 0.10), (0.62, 0.10),
-    # Row 1 — 3 elements
-    (0.24, 0.35), (0.50, 0.35), (0.76, 0.35),
+    # Row 1 — 4 elements
+    (0.14, 0.35), (0.38, 0.35), (0.62, 0.35),(0.86, 0.35),
     # Row 2 — 4 elements
-    (0.11, 0.60), (0.37, 0.60), (0.63, 0.60), (0.89, 0.60),
-    # Row 3 — 3 elements
-    (0.24, 0.85), (0.50, 0.85), (0.76, 0.85),
+    (0.14, 0.60), (0.38, 0.60), (0.62, 0.60),(0.86, 0.60),
+    # Row 3 — 2 elements
+    (0.38, 0.85), (0.62, 0.85),
 ]
 
 # Which pair each transducer belongs to (transducer_index → pair_index).
 # Consecutive pairs of transducers share a channel: 0,1→pair0; 2,3→pair1 …
-TRANSDUCER_PAIR = [i // 2 for i in range(12)]
+TRANSDUCER_PAIR = [2, 3, 4, 0, 1, 5, 5, 1, 0, 4, 3, 2]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PARAMETER DEFINITIONS
