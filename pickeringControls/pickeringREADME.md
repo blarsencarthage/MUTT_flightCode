@@ -6,6 +6,22 @@ NOTE: You MUST install the Pickering Direct IO drivers to your machine they are 
 
 - initPXIE() - Run this function in the main loop, will locate and initilize the connection with the pickering cabinet and saves the bus locations and typing of the cards in the connection. As of 6.11.26 it is unknown how this script works with keeping the connection open
     - RETURNS - array of pickering card objects each object contains the bus and device that the card is located at. 
+The card objects contain all values of the current waveform within themselves, although the function calls can get a little long. Initializing the pxie via initPXIE() returns an array of all valid 41-620 function generator cards. 
+
+All Get functions take a channel (SubNum) as their first argument unless noted otherwise.
+    - card.PILFG_GetWaveform(channel) - RETURNS waveform type as int (see FG_WfTypes enum: 0=SINE, 1=SQUARE, 2=TRIANGLE, 3=RAMP_UP, 4=RAMP_DOWN, 5=DC, 6=PULSE, 7=PWM, 8=ARB)
+    - card.PILFG_GetAmplitude(channel) - RETURNS amplitude as float (volts)
+    - card.PILFG_GetFrequency(channel) - RETURNS frequency as float (Hz)
+    - card.PILFG_GetDcOffset(channel) - RETURNS DC offset as float (volts, valid range 0-5)
+    - card.PILFG_GetStartPhase(channel) - RETURNS start phase as float (degrees, 0-360)
+    - card.PILFG_GetDutyCycleHigh(channel) - RETURNS duty cycle high as int (percent, for SQUARE/PWM waveforms)
+    - card.PILFG_GetPulseWidth(channel) - RETURNS pulse width as float (for PULSE waveform)
+    - card.PILFG_GetGenerationState(channel, size) - RETURNS list of generation states per channel
+    - card.PILFG_GetInputTriggerConfig() - RETURNS (source, trigger_mode) tuple, no channel argument
+    - card.PILFG_GetOutputTriggerConfig() - RETURNS trigger mode as int, no channel argument
+    - card.PILFG_GetInputTriggerEnable(channel, size) - RETURNS list of input trigger enable states
+    - card.PILFG_GetOutputTriggerEnable(channel, size) - RETURNS list of output trigger enable states
+    - card.PILFG_GetTriggerMonitorState(channel, size) - RETURNS list of trigger monitor states
 
 - updateWaveform() - updates the waveform of *card* on *channel* to be a sin waveform of frequency *frequency* (hz), amplitude *amplitude* (voltage ranging from 0), and offset *offset*
     - RETURNS - None
