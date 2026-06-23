@@ -12,33 +12,42 @@ if _pkg_dir not in sys.path:
 import pilpxi
 
 def initPXIE():
-    #Initalizes PXI interface and returns a list of 
+    #Initalizes PXI interface and returns a Base object, contains valid cards found, IP address, etc.
     base = pilpxi.Base()
-    free_cards = base.FindFreeCards()
+    if base is None:
+        print("Failed to initialize PXI interface.")
+        return None
+    else:
+        print("PXI interface initialized successfully.")
+    #Returns array of free cards, each element is a tuple of bus and device
+    freeCards = base.FindFreeCards()
 
-    if not free_cards:
+    if not freeCards:
         print("No devices found.")
+    else:  
+        print(f"Found {len(freeCards)} free devices.")
 
-    valid_devices = []
-    for bus, device in free_cards:
+    validDevices = []
+    for bus, device in freeCards:
         try:
-            probe = pilpxi.Pi_Card(bus, device)
-            if "41-620" in probe.CardId():
-                valid_devices.append((bus, device))
+            checkCard = pilpxi.Pi_Card(bus, device)
+            if "41-620" in checkCard.CardId(): #This check is to only allow the func gen through, may be the wrong typing 
+                validDevices.append((bus, device))
             else:
                 print(f"Device at bus={bus}, device={device} is not a 41-620 compliant card.")
-            probe.Close()
+            checkCard.Close()
         except pilpxi.Error as ex:
             print("Exception checking device:", ex.message)
 
     cards = []
-    for bus, device in valid_devices:
+    for bus, device in validDevices:
         try:
             card = pilpxi.Pi_Card(bus, device)
             card.ClearCard()
             cards.append(card)
         except pilpxi.Error as ex:
             print("Exception occurred:", ex.message)
+    print(f"Found {len(cards)} valid 41-620 compliant cards.")
     return cards
 
 
@@ -47,6 +56,7 @@ def updateWaveform(card, channel, frequency, amplitude, offset, phase=0.0):
         print("No card available.")
         return
     try:
+        print(f"Updating waveform on card {card.CardId()}, channel {channel}: frequency={frequency}, amplitude={amplitude}, offset={offset}, phase={phase}")
         card.outputOff(channel)
         card.PILFG_SetWaveform(channel, pilpxi.FG_WfTypes.PILFG_WAVEFORM_SINE)
         card.PILFG_SetAmplitude(channel, amplitude)
