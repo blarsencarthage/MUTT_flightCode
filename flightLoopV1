@@ -12,18 +12,10 @@ mode, command routing) is implemented here.
 Author: Braedon Larsen
 """
 
-import os
-import sys
 import threading
 import queue
 import time
 import logging
-
-# This file lives in flightCode/, but the hardware packages (pickeringControls,
-# spacecraftSerial) live at the repo root. Put the repo root on sys.path so the
-# imports below resolve however the file is launched (direct run, double-click,
-# or Windows service), not just via `python -m`.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pickeringControls.pickeringInterface as PI
 import spacecraftSerial.RS422 as craftSerial
@@ -45,9 +37,6 @@ THREAD_RESTART_LIMIT = 3           # restart attempts before safe mode
 JOIN_TIMEOUT         = 3.0         # s to wait on a thread during shutdown
 WORKER_GET_TIMEOUT   = 0.2         # s — every queue.get uses this, never blocks
 
-PXI_HEALTH_INTERVAL  = 5.0         # s between PXI connection ping checks
-PXI_REINIT_LIMIT     = 3           # failed reinit attempts before safe mode
-
 
 # ---------------------------------------------------------------------------
 # Shared state — the ONLY mutable state shared across threads
@@ -63,11 +52,8 @@ logQueue      = queue.Queue()        # any thread -> logger (never blocks caller
 heartbeat     = {}                   # threadName -> time.monotonic() timestamp
 heartbeatLock = threading.Lock()     # protects heartbeat dict
 
-restartCounts  = {}                   # threadName -> failed-restart count
-threads        = {}                   # threadName -> live threading.Thread
-
-pxiLock        = threading.Lock()    # protects pxiCards during watchdog reinit
-pxiReinitCount = 0                   # failed PXI reinit attempts
+restartCounts = {}                   # threadName -> failed-restart count
+threads       = {}                   # threadName -> live threading.Thread
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +67,8 @@ craftListener = None   # craftSerial.RS422 instance
 # ---------------------------------------------------------------------------
 # Experiment state (carried over from the original stub)
 # ---------------------------------------------------------------------------
-relayStates    = [False, False, False, False]
+relayStates    = [False, False, False, False] #Publically accessed by other threads
+currentRelayState = [False, False, False, False] #Compared to relayStates to determine if a relay has changed state
 waveformStates = [PI.waveAtributes(0, 0, 0, 0, 0, None) for _ in range(6)]
 
 
@@ -93,12 +80,10 @@ log = logging.getLogger("flight")
 
 def configureLogging():
     """Root logging config — file + stream, threadName in every record."""
-    import datetime
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     fmt = logging.Formatter(
         "%(asctime)s [%(threadName)s] %(levelname)s: %(message)s"
     )
-    fileHandler = logging.FileHandler(f"flight_{timestamp}.log")
+    fileHandler = logging.FileHandler("flight.log")
     fileHandler.setFormatter(fmt)
     streamHandler = logging.StreamHandler()
     streamHandler.setFormatter(fmt)
@@ -194,10 +179,7 @@ def pxi_ThreadManager():
         try:
             cmd = pxiQueue.get(timeout=WORKER_GET_TIMEOUT)
             # TODO: parse cmd -> waveAtributes, pick the target card, then:
-            #   with pxiLock:
-            #       PI.updateWaveform(pxiCards[idx], wave)
-            # Acquire pxiLock around any pxiCards access — the watchdog may
-            # replace the list during a reinit.
+            #   PI.updateWaveform(pxiCards[idx], wave)
             logMsg("INFO", f"{name} handling: {cmd!r}")
         except queue.Empty:
             pass
@@ -247,7 +229,7 @@ def telemetry_ThreadManager():
 
 # ===========================================================================
 # Thread factories + restart  (factory lambdas let us rebuild a Thread object)
-# ===========================================================================
+# ===========================z================================================
 THREAD_FACTORIES = {
     "SERIAL": lambda: threading.Thread(
         target=craftSerial_ThreadManager, name="SERIAL", daemon=True),
@@ -289,75 +271,10 @@ def restartThread(name):
 
 
 # ===========================================================================
-# PXI hardware health
-# ===========================================================================
-def checkPXIHealth():
-    """Ping every open card by reading its CardId. Returns True if all respond.
-
-    CardId() is a lightweight read over the PXI bus. A pilpxi.Error or any
-    other exception means that card (or the whole cabinet) is not responding.
-    Called from the watchdog — always holds pxiLock before entering.
-    """
-    import pilpxi
-    if not pxiCards:
-        logMsg("WARNING", "PXI health check: no cards registered")
-        return False
-    for i, card in enumerate(pxiCards):
-        try:
-            card.CardId()
-        except pilpxi.Error as e:
-            logMsg("ERROR", f"PXI health check: card {i} not responding ({e.message})")
-            return False
-        except Exception as e:
-            logMsg("ERROR", f"PXI health check: card {i} unexpected error ({e})")
-            return False
-    return True
-
-
-def reinitPXI():
-    """Close all existing card handles and re-run initPXIE().
-
-    Replaces pxiCards in-place under pxiLock so the PXI worker always sees a
-    consistent list. Increments pxiReinitCount; triggers safe mode when the
-    limit is exceeded.
-    """
-    global pxiCards, pxiReinitCount
-    pxiReinitCount += 1
-
-    if pxiReinitCount > PXI_REINIT_LIMIT:
-        logMsg("CRITICAL",
-               f"PXI reinit exceeded {PXI_REINIT_LIMIT} attempts — safe mode")
-        triggerSafeMode()
-        return
-
-    logMsg("WARNING", f"PXI reinit attempt {pxiReinitCount}")
-
-    # Close existing handles before rebuilding — ignore errors on close.
-    with pxiLock:
-        for card in pxiCards:
-            try:
-                card.Close()
-            except Exception:
-                pass
-        pxiCards.clear()
-
-        try:
-            newCards = PI.initPXIE()
-            if newCards:
-                pxiCards.extend(newCards)
-                logMsg("INFO", f"PXI reinit succeeded: {len(pxiCards)} card(s) restored")
-                pxiReinitCount = 0   # reset count on a clean recovery
-            else:
-                logMsg("ERROR", "PXI reinit returned no cards")
-        except Exception as e:
-            logMsg("ERROR", f"PXI reinit failed: {e}")
-
-
-# ===========================================================================
 # Watchdog
 # ===========================================================================
 def watchdog_ThreadManager():
-    """Health monitor: liveness, heartbeat staleness, queue depth, PXI hardware.
+    """Health monitor: liveness, heartbeat staleness, and queue depth.
 
     Runs every WATCHDOG_INTERVAL. Not auto-restartable from within itself —
     the main loop is the backstop if the watchdog ever dies.
@@ -369,7 +286,6 @@ def watchdog_ThreadManager():
         "relay":   relayQueue,
         "log":     logQueue,
     }
-    lastPXICheck = 0.0   # monotonic timestamp of the last PXI ping
 
     while not stopEvent.is_set():
         now = time.monotonic()
@@ -399,15 +315,6 @@ def watchdog_ThreadManager():
                 logMsg("CRITICAL", f"{qName} queue depth {depth} (alarm)")
             elif depth >= QUEUE_DEPTH_WARN:
                 logMsg("WARNING", f"{qName} queue depth {depth} (warn)")
-
-        # 4. PXI hardware health — ping cards on their own slower interval.
-        if now - lastPXICheck >= PXI_HEALTH_INTERVAL:
-            lastPXICheck = now
-            with pxiLock:
-                healthy = checkPXIHealth()
-            if not healthy:
-                logMsg("ERROR", "PXI health check failed — reinitialising connection")
-                reinitPXI()
 
         updateHeartbeat(name)
         time.sleep(WATCHDOG_INTERVAL)
@@ -547,7 +454,7 @@ def main():
     except KeyboardInterrupt:
         logMsg("INFO", "KeyboardInterrupt — shutting down")
     finally:
-        shutdown()
+        shutdown()  
 
 
 if __name__ == "__main__":
