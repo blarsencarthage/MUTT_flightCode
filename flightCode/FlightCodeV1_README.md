@@ -112,7 +112,17 @@ Entry point. Configures logging, starts the telemetry thread first (so hardware 
 
 heartbeat - dictionary with entries for each thread. Each completion of the loop updates the monotonic time (NOTE: monotonic time counts from a undefined reference point, only consider deltas of monoatomic time as valid). 
 
+pxiCards - array of Pi_Card objects that contain the bus and device of each card, the card object is addressed to access each induvidual function generator 
 
+relaySer - serial object for the Numato board, commands to the serial port for the usb are addressed here 
+
+craftListener - instance of the RS422 object for recieving craft signals 
+
+relayStates - publically accessed array with the state of each relay, other modules update this array and the relay manager reads it for updates
+
+currentRelayState - the private array that the relay manager compares against to check each relays status, once each relay has been flipped the relay manager updates this variable
+
+waveformStates - record of the current waveform states that the function generators are outputting 
 
 ## Architecture 
 The code is split into 5 worker threads, each of the threads executes its own section and prevents waiting for hardware responses or other delays to cause delays in execution. 

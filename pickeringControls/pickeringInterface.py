@@ -4,13 +4,12 @@
 #Updated 6.23.26
 import os
 import sys
-
-_pkg_dir = os.path.join(os.path.dirname(__file__), "python_pilpxi_v1.7")
-if _pkg_dir not in sys.path:
-    sys.path.insert(0, _pkg_dir)
-
-import pilpxi
-
+_pkg_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_pkg_dir, "pilxi-5.7"))
+#TODO: Revise waveAtributes class to include the card address and channel number, bring 
+#updateWaveform into the class and have it run whenever any of the set functions are run.
+import pilxi
+import pi620lx
 
 class waveAtributes:
     """Stores all parameters that describe a single waveform channel output."""
@@ -22,7 +21,7 @@ class waveAtributes:
         self._amplitude = amplitude
         self._offset = offset
         self._phase = phase % 360.0
-        self._waveform_type = waveform_type  # expects a pilpxi.FG_WfTypes value
+        self._waveform_type = waveform_type  # expects a pilxi.WaveformTypes value
 
     # --- channel ---
     def getChannel(self):
@@ -73,42 +72,28 @@ class waveAtributes:
 
 
 
-def initPXIE():
-    #Initalizes PXI interface and returns a Base object, contains valid cards found, IP address, etc.
-    base = pilpxi.Base()
-    if base is None:
+def initPXIE(ip_address="pxi"):
+    #Initalizes PXI interface and returns a list of open card objects.
+
+    session = pilxi.Pi_Session(ip_address)
+
+    if session is None:
         print("Failed to initialize PXI interface.")
         return None
     else:
         print("PXI interface initialized successfully.")
-    #Returns array of free cards, each element is a tuple of bus and device
-    freeCards = base.FindFreeCards()
 
-    if not freeCards:
-        print("No devices found.")
-    else:  
-        print(f"Found {len(freeCards)} free devices.")
-
-    validDevices = []
-    for bus, device in freeCards:
-        try:
-            checkCard = pilpxi.Pi_Card(bus, device)
-            if "41-620" in checkCard.CardId(): #This check is to only allow the func gen through, may be the wrong typing 
-                validDevices.append((bus, device))
-            else:
-                print(f"Device at bus={bus}, device={device} is not a 41-620 compliant card.")
-            checkCard.Close()
-        except pilpxi.Error as ex:
-            print("Exception checking device:", ex.message)
+    freeCards = session.FindFreeCards()
 
     cards = []
-    for bus, device in validDevices:
+    for bus, device in freeCards:
         try:
-            card = pilpxi.Pi_Card(bus, device)
+            card = session.OpenCard(bus, device)
             card.ClearCard()
             cards.append(card)
-        except pilpxi.Error as ex:
+        except pilxi.Error as ex:
             print("Exception occurred:", ex.message)
+
     print(f"Found {len(cards)} valid 41-620 compliant cards.")
     return cards
 
@@ -122,22 +107,22 @@ def updateWaveform(card, wave: waveAtributes):
     amplitude = wave.getAmplitude()
     offset    = wave.getOffset()
     phase     = wave.getPhase()
-    wf_type   = wave.getWaveformType() or pilpxi.FG_WfTypes.PILFG_WAVEFORM_SINE
+    wf_type   = wave.getWaveformType() or pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE
     try:
         print(f"Updating waveform on card {card.CardId()}, channel {channel}: "
               f"frequency={frequency}, amplitude={amplitude}, offset={offset}, phase={phase}")
-        card.outputOff(channel)
-        card.PILFG_SetWaveform(channel, wf_type)
-        card.PILFG_SetAmplitude(channel, amplitude)
-        card.PILFG_SetFrequency(channel, frequency)
+        card.PIFGLX_AbortGeneration(channel)
+        card.PIFGLX_SetWaveform(channel, wf_type)
+        card.PIFGLX_SetAmplitude(channel, amplitude)
+        card.PIFGLX_SetFrequency(channel, frequency)
         if offset < 0 or offset > 5:
             print("Offset voltage must be between 0 and 5 volts.")
-            card.PILFG_SetDcOffset(channel, 0)
+            card.PIFGLX_SetDcOffset(channel, 0)
         else:
-            card.PILFG_SetDcOffset(channel, offset)
-        card.PILFG_SetStartPhase(channel, phase)
-        card.PILFG_InitiateGeneration(channel)
-    except pilpxi.Error as error:
+            card.PIFGLX_SetDcOffset(channel, offset)
+        card.PIFGLX_SetStartPhase(channel, phase)
+        card.PIFGLX_InitiateGeneration(channel)
+    except pilxi.Error as error:
         print("Exception occurred:", error.message)
 
 def waveformSelfCheck(cards):
@@ -177,7 +162,7 @@ def waveformSelfCheck(cards):
         # Identify the card
         try:
             card_id = card.CardId()
-        except pilpxi.Error as ex:
+        except pilxi.Error as ex:
             print(f"\n  {card_label}: FAILED — could not read CardId ({ex.message})")
             failed.append((i + 1, "Unknown", f"CardId read failed: {ex.message}"))
             continue
@@ -186,25 +171,25 @@ def waveformSelfCheck(cards):
 
         # --- Write test values ---
         try:
-            card.PILFG_AbortGeneration(TEST_CHANNEL)
-            card.PILFG_SetWaveform(TEST_CHANNEL, pilpxi.FG_WfTypes.PILFG_WAVEFORM_SINE)
-            card.PILFG_SetFrequency(TEST_CHANNEL, TEST_FREQUENCY)
-            card.PILFG_SetAmplitude(TEST_CHANNEL, TEST_AMPLITUDE)
-            card.PILFG_SetDcOffset(TEST_CHANNEL, TEST_OFFSET)
-            card.PILFG_SetStartPhase(TEST_CHANNEL, TEST_PHASE)
-            card.PILFG_InitiateGeneration(TEST_CHANNEL)
-        except pilpxi.Error as ex:
+            card.PIFGLX_AbortGeneration(TEST_CHANNEL)
+            card.PIFGLX_SetWaveform(TEST_CHANNEL, pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE)
+            card.PIFGLX_SetFrequency(TEST_CHANNEL, TEST_FREQUENCY)
+            card.PIFGLX_SetAmplitude(TEST_CHANNEL, TEST_AMPLITUDE)
+            card.PIFGLX_SetDcOffset(TEST_CHANNEL, TEST_OFFSET)
+            card.PIFGLX_SetStartPhase(TEST_CHANNEL, TEST_PHASE)
+            card.PIFGLX_InitiateGeneration(TEST_CHANNEL)
+        except pilxi.Error as ex:
             print(f"    FAILED — could not write test values ({ex.message})")
             failed.append((i + 1, card_id, f"Write failed: {ex.message}"))
             continue
 
         # --- Read values back ---
         try:
-            read_freq   = card.PILFG_GetFrequency(TEST_CHANNEL)
-            read_amp    = card.PILFG_GetAmplitude(TEST_CHANNEL)
-            read_offset = card.PILFG_GetDcOffset(TEST_CHANNEL)
-            read_phase  = card.PILFG_GetStartPhase(TEST_CHANNEL)
-        except pilpxi.Error as ex:
+            read_freq   = card.PIFGLX_GetFrequency(TEST_CHANNEL)
+            read_amp    = card.PIFGLX_GetAmplitude(TEST_CHANNEL)
+            read_offset = card.PIFGLX_GetDcOffset(TEST_CHANNEL)
+            read_phase  = card.PIFGLX_GetStartPhase(TEST_CHANNEL)
+        except pilxi.Error as ex:
             print(f"    FAILED — could not read back values ({ex.message})")
             failed.append((i + 1, card_id, f"Read failed: {ex.message}"))
             continue
