@@ -66,23 +66,23 @@ heartbeatLock = threading.Lock()     # protects heartbeat dict
 restartCounts  = {}                   # threadName -> failed-restart count
 threads        = {}                   # threadName -> live threading.Thread
 
-pxiLock        = threading.Lock()    # protects pxiCards during watchdog reinit
+pxiLock        = threading.Lock()    # protects pxiWaves during watchdog reinit
 pxiReinitCount = 0                   # failed PXI reinit attempts
 
 
 # ---------------------------------------------------------------------------
 # Hardware handles — populated by initHardware(), consumed by the workers
 # ---------------------------------------------------------------------------
-pxiCards      = []     # list of pilpxi.Pi_Card (41-620 function generators)
+pxiWaves      = []     # list of waveAtributes (3 per card) returned by initPXIE()
 relaySer      = None   # serial.Serial to the Numato board
 craftListener = None   # craftSerial.RS422 instance
 
 
 # ---------------------------------------------------------------------------
-# Experiment state (carried over from the original stub)
+# Experiment state 
 # ---------------------------------------------------------------------------
 relayStates    = [False, False, False, False]
-waveformStates = [PI.waveAtributes(0, 0, 0, 0, 0, None) for _ in range(6)]
+# waveform state is carried by each waveAtributes object inside pxiWaves
 
 
 # ---------------------------------------------------------------------------
@@ -193,10 +193,12 @@ def pxi_ThreadManager():
     while not stopEvent.is_set():
         try:
             cmd = pxiQueue.get(timeout=WORKER_GET_TIMEOUT)
-            # TODO: parse cmd -> waveAtributes, pick the target card, then:
+            # TODO: parse cmd -> wave index + new parameters, then:
             #   with pxiLock:
-            #       PI.updateWaveform(pxiCards[idx], wave)
-            # Acquire pxiLock around any pxiCards access — the watchdog may
+            #       wave = pxiWaves[idx]
+            #       wave.setFrequency(...); wave.setAmplitude(...); etc.
+            #       PI.updateWaveform(wave._card, wave)
+            # Acquire pxiLock around any pxiWaves access — the watchdog may
             # replace the list during a reinit.
             logMsg("INFO", f"{name} handling: {cmd!r}")
         except queue.Empty:
@@ -298,18 +300,19 @@ def checkPXIHealth():
     other exception means that card (or the whole cabinet) is not responding.
     Called from the watchdog — always holds pxiLock before entering.
     """
-    import pilpxi
-    if not pxiCards:
-        logMsg("WARNING", "PXI health check: no cards registered")
+    if not pxiWaves:
+        logMsg("WARNING", "PXI health check: no waves registered")
         return False
-    for i, card in enumerate(pxiCards):
+    seen = set()
+    for i, wave in enumerate(pxiWaves):
+        card = wave._card
+        if id(card) in seen:
+            continue
+        seen.add(id(card))
         try:
             card.CardId()
-        except pilpxi.Error as e:
-            logMsg("ERROR", f"PXI health check: card {i} not responding ({e.message})")
-            return False
         except Exception as e:
-            logMsg("ERROR", f"PXI health check: card {i} unexpected error ({e})")
+            logMsg("ERROR", f"PXI health check: card {i // 3} not responding ({e})")
             return False
     return True
 
@@ -321,7 +324,7 @@ def reinitPXI():
     consistent list. Increments pxiReinitCount; triggers safe mode when the
     limit is exceeded.
     """
-    global pxiCards, pxiReinitCount
+    global pxiWaves, pxiReinitCount
     pxiReinitCount += 1
 
     if pxiReinitCount > PXI_REINIT_LIMIT:
@@ -332,23 +335,28 @@ def reinitPXI():
 
     logMsg("WARNING", f"PXI reinit attempt {pxiReinitCount}")
 
-    # Close existing handles before rebuilding — ignore errors on close.
+    # Close unique card handles before rebuilding — ignore errors on close.
     with pxiLock:
-        for card in pxiCards:
-            try:
-                card.Close()
-            except Exception:
-                pass
-        pxiCards.clear()
+        seen = set()
+        for wave in pxiWaves:
+            card = wave._card
+            if id(card) not in seen:
+                seen.add(id(card))
+                try:
+                    card.Close()
+                except Exception:
+                    pass
+        pxiWaves.clear()
 
         try:
-            newCards = PI.initPXIE()
-            if newCards:
-                pxiCards.extend(newCards)
-                logMsg("INFO", f"PXI reinit succeeded: {len(pxiCards)} card(s) restored")
+            newWaves = PI.initPXIE()
+            if newWaves:
+                pxiWaves.extend(newWaves)
+                n_cards = len(pxiWaves) // 3
+                logMsg("INFO", f"PXI reinit succeeded: {n_cards} card(s) restored")
                 pxiReinitCount = 0   # reset count on a clean recovery
             else:
-                logMsg("ERROR", "PXI reinit returned no cards")
+                logMsg("ERROR", "PXI reinit returned no waves")
         except Exception as e:
             logMsg("ERROR", f"PXI reinit failed: {e}")
 
@@ -434,7 +442,7 @@ def triggerSafeMode():
 
     # All PXI / function generator outputs zeroed.
     try:
-        # TODO: for card in pxiCards: zero/abort every channel
+        # TODO: for wave in pxiWaves: wave._card.PIFGLX_AbortGeneration(wave.getChannel())
         logMsg("INFO", "Safe mode: PXI outputs zeroed")
     except Exception as e:
         logMsg("ERROR", f"Safe mode PXI shutdown failed: {e}")
@@ -456,13 +464,13 @@ def initHardware():
     Returns True on success. Failures are logged; decide per-device whether a
     failure is fatal as the self-checks are fleshed out.
     """
-    global pxiCards, relaySer, craftListener
+    global pxiWaves, relaySer, craftListener
     ok = True
 
     # --- Pickering PXI cabinet + function-generator self-check ---
     try:
-        pxiCards = PI.initPXIE()
-        # TODO: PI.waveformSelfCheck(pxiCards) and act on the result
+        pxiWaves = PI.initPXIE()
+        # TODO: PI.waveformSelfCheck([w._card for w in pxiWaves]) and act on the result
     except Exception as e:
         logMsg("ERROR", f"PXI init failed: {e}")
         ok = False
