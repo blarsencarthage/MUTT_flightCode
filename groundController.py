@@ -1,6 +1,7 @@
 
 # Author: Braedon Larsen
 # Created: 2026-06-11
+#Updated: 2026-06-23
 # GUI controller for 12-element phased array ultrasonic transducer system.
 
 import os
@@ -9,7 +10,7 @@ import math
 import tkinter as tk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pickeringControls.pickeringInterface import initPXIE, updateWaveform
+from pickeringControls.pickeringInterface import initPXIE, updateWaveform, waveAtributes
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HARDWARE CONFIGURATION
@@ -18,7 +19,7 @@ from pickeringControls.pickeringInterface import initPXIE, updateWaveform
 NUM_PAIRS = 6
 
 # pair_index → (card_list_index, channel_number)
-# card_list_index is the position in the list returned by initPXIE()
+# wave_list_index = card_list_index * 3 + (channel_number - 1)
 CHANNEL_MAP = {
     0: (0, 1), 1: (0, 2), 2: (0, 3),
     3: (1, 1), 4: (1, 2), 5: (1, 3),
@@ -186,12 +187,12 @@ class ScrollFrame(tk.Frame):
 class PairControls(tk.Frame):
     """Slider + entry controls for one transducer pair."""
 
-    def __init__(self, parent, pair_idx: int, cards: list,
+    def __init__(self, parent, pair_idx: int, waves: list,
                  on_focus=None, **kw):
         bg = BG if pair_idx % 2 == 0 else BG_ALT
         super().__init__(parent, bg=bg, padx=4, pady=4, **kw)
         self._idx = pair_idx
-        self._cards = cards        # shared list; mutated by main app on init
+        self._waves = waves        # shared list; mutated by main app on init
         self._on_focus = on_focus
         self._bg = bg
         self._vars: dict[str, tk.DoubleVar] = {}
@@ -275,18 +276,17 @@ class PairControls(tk.Frame):
         if self._on_focus:
             self._on_focus(self._idx)
         card_idx, channel = CHANNEL_MAP[self._idx]
-        if card_idx < len(self._cards):
-            updateWaveform(
-                self._cards[card_idx],
-                channel,
-                frequency=self._vars["freq"].get(),
-                amplitude=self._vars["amp"].get(),
-                offset=self._vars["offset"].get(),
-                phase=self._vars["phase"].get(),
-            )
+        wave_idx = card_idx * 3 + (channel - 1)
+        if wave_idx < len(self._waves):
+            wave = self._waves[wave_idx]
+            wave.setFrequency(self._vars["freq"].get())
+            wave.setAmplitude(self._vars["amp"].get())
+            wave.setOffset(self._vars["offset"].get())
+            wave.setPhase(self._vars["phase"].get())
+            updateWaveform(wave._card, wave)
         else:
-            print(f"Pair {self._idx + 1}: card index {card_idx} not available "
-                  f"({len(self._cards)} card(s) found).")
+            print(f"Pair {self._idx + 1}: wave index {wave_idx} not available "
+                  f"({len(self._waves)} waveform(s) initialized).")
 
     def apply(self) -> None:
         """Public entry point for 'Apply All'."""
@@ -305,8 +305,8 @@ class PhasedArrayGUI(tk.Tk):
         self.minsize(960, 520)
 
         # Shared list — PairControls holds a reference to this same object.
-        # Populated after hardware init so all controls see the real cards.
-        self._cards: list = []
+        # Populated after hardware init so all controls see the real waveforms.
+        self._waves: list = []
         self._pair_controls: list[PairControls] = []
 
         self._build_ui()
@@ -351,7 +351,7 @@ class PhasedArrayGUI(tk.Tk):
 
         for i in range(NUM_PAIRS):
             ctrl = PairControls(scroll.inner, pair_idx=i,
-                                cards=self._cards,
+                                waves=self._waves,
                                 on_focus=self._on_pair_select)
             ctrl.pack(fill="x", pady=1)
             # thin separator
@@ -373,9 +373,9 @@ class PhasedArrayGUI(tk.Tk):
 
     def _init_hardware(self) -> None:
         try:
-            cards = initPXIE()
-            self._cards.extend(cards)
-            n = len(cards)
+            waves = initPXIE()
+            self._waves.extend(waves)
+            n = len(waves) // 3  # 3 channels per card
             self._status_var.set(
                 f"Connected — {n} card{'s' if n != 1 else ''} found")
         except Exception as ex:
@@ -392,12 +392,11 @@ class PhasedArrayGUI(tk.Tk):
             ctrl.apply()
 
     def _stop_all(self) -> None:
-        for card in self._cards:
-            for ch in range(1, 7):
-                try:
-                    card.PILFG_AbortGeneration(ch)
-                except Exception:
-                    pass
+        for wave in self._waves:
+            try:
+                wave._card.PIFGLX_AbortGeneration(wave.getChannel())
+            except Exception:
+                pass
         self._status_var.set("All channels stopped")
 
 

@@ -14,7 +14,7 @@ import pi620lx
 class waveAtributes:
     """Stores all parameters that describe a single waveform channel output."""
 
-    def __init__(self, channel, card: pi620lx.Pi_Card_ByDevice, frequency, amplitude, offset, phase=0.0,
+    def __init__(self, channel, card: pilxi.Pi_Card_ByDevice, frequency, amplitude, offset, phase=0.0,
                  waveform_type=pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE):
         self._channel = channel
         self._card = card
@@ -96,7 +96,8 @@ def initPXIE(ip_address="pxi"):
             print("Exception occurred:", ex.message)
 
     print(f"Found {len(cards)} valid cards.")
-    return cards
+    cardWaves = buildWaveforms(cards)
+    return cardWaves
 
 
 def updateWaveform(card, wave: waveAtributes):
@@ -239,3 +240,16 @@ def waveformSelfCheck(cards):
             print(f"  Card {idx}: {cid} — {reason}")
 
     return {"passed": passed, "failed": failed}
+
+def buildWaveforms(cardArray):
+    """"
+    Builds a list of 6 waveAtributes objects, 3 per card.
+    
+    """   
+    waveforms = []
+    for card in cardArray:
+        for channel in range(1, 4): #Using 3 channels per card  
+            wave = waveAtributes(channel=channel, card=card, frequency=0, amplitude=0, offset=0)
+            waveforms.append(wave)
+
+    
