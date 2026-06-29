@@ -14,14 +14,15 @@ import pi620lx
 class waveAtributes:
     """Stores all parameters that describe a single waveform channel output."""
 
-    def __init__(self, channel, frequency, amplitude, offset, phase=0.0,
-                 waveform_type=None):
+    def __init__(self, channel, card: pi620lx.Pi_Card_ByDevice, frequency, amplitude, offset, phase=0.0,
+                 waveform_type=pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE):
         self._channel = channel
+        self._card = card
         self._frequency = frequency
         self._amplitude = amplitude
         self._offset = offset
         self._phase = phase % 360.0
-        self._waveform_type = waveform_type  # expects a pilxi.WaveformTypes value
+        self._waveform_type = waveform_type #Will always be a sin wave, requires mods to be otherwise
 
     # --- channel ---
     def getChannel(self):
@@ -83,18 +84,18 @@ def initPXIE(ip_address="pxi"):
     else:
         print("PXI interface initialized successfully.")
 
-    freeCards = session.FindFreeCards()
+    freeCards = session.FindFreeCards() #Returns a list of tuples (bus, device) for each free card found.
 
-    cards = []
-    for bus, device in freeCards:
-        try:
-            card = session.OpenCard(bus, device)
+    cards = [] 
+    for bus, device in freeCards: #Opens sessions with each free card and appends them to the cards list.
+        try: # NOTE: As long as the session with the LXI is open, the card will remain open. 
+            card = session.OpenCard(bus, device) #Returns a Pi_Card_ByDevice object 
             card.ClearCard()
             cards.append(card)
         except pilxi.Error as ex:
             print("Exception occurred:", ex.message)
 
-    print(f"Found {len(cards)} valid 41-620 compliant cards.")
+    print(f"Found {len(cards)} valid cards.")
     return cards
 
 
@@ -107,7 +108,7 @@ def updateWaveform(card, wave: waveAtributes):
     amplitude = wave.getAmplitude()
     offset    = wave.getOffset()
     phase     = wave.getPhase()
-    wf_type   = wave.getWaveformType() or pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE
+    wf_type   = wave.getWaveformType()
     try:
         print(f"Updating waveform on card {card.CardId()}, channel {channel}: "
               f"frequency={frequency}, amplitude={amplitude}, offset={offset}, phase={phase}")
