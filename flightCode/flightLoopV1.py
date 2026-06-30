@@ -60,7 +60,7 @@ pxiQueue      = queue.Queue()        # dispatcher -> PXI worker
 relayQueue    = queue.Queue()        # dispatcher -> relay worker
 logQueue      = queue.Queue()        # any thread -> logger (never blocks caller)
 
-heartbeat     = {}                   # threadName -> time.monotonic() timestamp
+heartbeat     = {}                   # dict[threadName, time.monotonic()] 
 heartbeatLock = threading.Lock()     # protects heartbeat dict
 
 restartCounts  = {}                   # threadName -> failed-restart count
@@ -82,6 +82,10 @@ craftListener = None   # craftSerial.RS422 instance
 # Experiment state 
 # ---------------------------------------------------------------------------
 relayStates    = [False, False, False, False]
+#If a specifc craft signal has been recived 
+signalStates: dict[str, bool] = {"sep": False , "zgStart": False, "zgStop": False}
+#The time that the signal was recived
+signalTimestamps: dict[str, float] = {"sep": 0.0, "zgStart": 0.0, "zgStop": 0.0}
 # waveform state is carried by each waveAtributes object inside pxiWaves
 
 
