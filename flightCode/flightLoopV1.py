@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pickeringControls.pickeringInterface as PI
 import spacecraftSerial.RS422 as craftSerial
-
+import RelayCode as relayControls
 
 # ---------------------------------------------------------------------------
 # Tunable constants  (SCREAMING_SNAKE kept — idiomatic for module constants)
@@ -76,7 +76,7 @@ pxiReinitCount = 0                   # failed PXI reinit attempts
 pxiWaves      = []     # list of waveAtributes (3 per card) returned by initPXIE()
 relaySer      = None   # serial.Serial to the Numato board
 craftListener = None   # craftSerial.RS422 instance
-
+craftController = None  # relayControls.RelayController instance
 
 # ---------------------------------------------------------------------------
 # Experiment state 
@@ -176,8 +176,10 @@ def craftSerial_ThreadManager():
     its registered signals and forward anything detected into routeCommand().
     """
     name = "SERIAL"
+    
     while not stopEvent.is_set():
         try:
+
             # TODO: replace with the real signal set / read API once defined.
             #   e.g. for sig in ("launch", "abort"):
             #            value = craftListener.detected(sig)
@@ -218,8 +220,13 @@ def relay_ThreadManager():
     while not stopEvent.is_set():
         try:
             cmd = relayQueue.get(timeout=WORKER_GET_TIMEOUT)
-            # TODO: parse cmd -> relay number/state, then write to relaySer:
-            #   relaySer.write(f"relay on {n}\r".encode())
+            for i, relay in enumerate(relayStates):
+                if relay: 
+                    craftController.turnOnRelay(i)
+                    logMsg("INFO", f"Relay {i} turned ON")
+                else: 
+                    craftController.turnOffRelay(i)
+                    logMsg("INFO", f"Relay {i} turned OFF")
             logMsg("INFO", f"{name} handling: {cmd!r}")
         except queue.Empty:
             pass
@@ -468,7 +475,7 @@ def initHardware():
     Returns True on success. Failures are logged; decide per-device whether a
     failure is fatal as the self-checks are fleshed out.
     """
-    global pxiWaves, relaySer, craftListener
+    global pxiWaves, relaySer, craftListener, relayController
     ok = True
 
     # --- Pickering PXI cabinet + function-generator self-check ---
@@ -479,14 +486,6 @@ def initHardware():
         logMsg("ERROR", f"PXI init failed: {e}")
         ok = False
 
-    # --- Numato relay board: open port + relay power self-check ---
-    try:
-        import serial
-        relaySer = serial.Serial(RELAY_PORT, RELAY_BAUD, timeout=1)
-        # TODO: relay self-check (verify each relay has power to flip)
-    except Exception as e:
-        logMsg("ERROR", f"Relay init failed: {e}")
-        ok = False
 
     # --- Spacecraft RS-422 listener ---
     try:
@@ -495,6 +494,12 @@ def initHardware():
         craftListener.start()
     except Exception as e:
         logMsg("ERROR", f"Craft serial init failed: {e}")
+        ok = False
+    # --- Relay controller Opening ---
+    try:
+        relayController = relayControls.RelayController(port = RELAY_PORT, baud = RELAY_BAUD)
+    except Exception as e:
+        logMsg("ERROR", f"Relay controller init failed: {e}")
         ok = False
 
     return ok
