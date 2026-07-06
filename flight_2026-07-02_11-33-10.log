@@ -1,0 +1,16 @@
+2026-07-02 11:33:10,749 [FlightMain] INFO: Flight controller starting
+2026-07-02 11:33:10,968 [rs422-reader] INFO: Reader: connected to COM3
+2026-07-02 11:33:10,969 [FlightMain] INFO: RS422 listener started on COM3 @ 9600 baud
+2026-07-02 11:34:29,557 [TELEM] INFO: PXI config 1 active — running for 25.0s
+2026-07-02 11:34:54,566 [TELEM] INFO: PXI config 1 settling — waiting 3.0s
+2026-07-02 11:34:57,624 [TELEM] INFO: PXI config 2 active — running for 22.0s
+2026-07-02 11:35:19,634 [TELEM] INFO: PXI config 2 settling — waiting 3.0s
+2026-07-02 11:35:22,688 [TELEM] INFO: PXI config 3 active — running for 22.0s
+2026-07-02 11:35:44,708 [TELEM] INFO: PXI config 3 settling — waiting 3.0s
+2026-07-02 11:35:47,784 [TELEM] INFO: PXI config 4 active — running for 23.0s
+2026-07-02 11:36:10,798 [TELEM] INFO: PXI config 4 settling — waiting 3.0s
+2026-07-02 11:36:13,853 [TELEM] INFO: PXI config 5 active — running for 18.0s
+2026-07-02 11:36:31,861 [TELEM] INFO: PXI config 5 settling — waiting 3.0s
+2026-07-02 11:36:34,925 [TELEM] INFO: PXI config 6 active — running for 11.0s
+2026-07-02 11:36:45,939 [TELEM] INFO: PXI config 6 settling — waiting 3.0s
+2026-07-02 11:36:48,946 [TELEM] INFO: PXI all configurations complete

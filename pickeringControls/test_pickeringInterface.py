@@ -1,8 +1,8 @@
 """
 Unit tests for pickeringInterface.py — no physical hardware required.
 
-Strategy: inject a fake `pilpxi` module into sys.modules *before* importing
-pickeringInterface, so the real ctypes DLL is never touched.
+Strategy: inject fake `pilxi` and `pi620lx` modules into sys.modules *before*
+importing pickeringInterface, so no ctypes DLLs are touched.
 
 Run from the project root:
     python -m pytest pickeringControls/test_pickeringInterface.py -v
@@ -13,44 +13,51 @@ Run from the project root:
 import sys
 import os
 import unittest
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 from types import ModuleType
 
-# ── Fake pilpxi module ────────────────────────────────────────────────────────
-# Must be injected into sys.modules before pickeringInterface is imported.
+# ── Fake pilxi module ─────────────────────────────────────────────────────────
 
-class _FakePilpxiError(Exception):
-    """Mirrors pilpxi.Error so `except pilpxi.Error` clauses work correctly."""
+class _FakePilxiError(Exception):
     def __init__(self, message, errorCode=None):
         self.message = message
         self.errorCode = errorCode
     def __str__(self):
         return self.message
 
-_fake_pilpxi = ModuleType("pilpxi")
-_fake_pilpxi.Error = _FakePilpxiError
+_fake_pilxi = ModuleType("pilxi")
+_fake_pilxi.Error = _FakePilxiError
 
 _fake_wf_types = MagicMock()
-_fake_wf_types.PILFG_WAVEFORM_SINE = 0x0
-_fake_pilpxi.FG_WfTypes = _fake_wf_types
+_fake_wf_types.PIFGLX_WAVEFORM_SINE = 0x0
+_fake_pilxi.WaveformTypes = _fake_wf_types
 
-# Placeholder callables; replaced per-test in setUp
-_fake_pilpxi.Base = MagicMock()
-_fake_pilpxi.Pi_Card = MagicMock()
+_fake_pilxi.Pi_Session = MagicMock()
 
-sys.modules.pop("pilpxi", None)
-sys.modules["pilpxi"] = _fake_pilpxi
+sys.modules.pop("pilxi", None)
+sys.modules["pilxi"] = _fake_pilxi
+
+# ── Fake pi620lx module ───────────────────────────────────────────────────────
+
+_fake_pi620lx = ModuleType("pi620lx")
+sys.modules.pop("pi620lx", None)
+sys.modules["pi620lx"] = _fake_pi620lx
 
 # ── Import module under test ──────────────────────────────────────────────────
+
 sys.path.insert(0, os.path.dirname(__file__))
 sys.modules.pop("pickeringInterface", None)
 import pickeringInterface as pi
 
 
-# ── Helper ────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_card():
     return MagicMock()
+
+def _make_wave(channel=1, frequency=1000.0, amplitude=1.0, offset=0.5, phase=0.0):
+    return pi.waveAtributes(channel=channel, frequency=frequency,
+                            amplitude=amplitude, offset=offset, phase=phase)
 
 
 # ── initPXIE tests ────────────────────────────────────────────────────────────
@@ -58,184 +65,133 @@ def _make_card():
 class TestInitPXIE(unittest.TestCase):
 
     def setUp(self):
-        _fake_pilpxi.Base = MagicMock()
-        _fake_pilpxi.Pi_Card = MagicMock()
+        self.mock_session = MagicMock()
+        self.mock_session.FindFreeCards.return_value = []
+        _fake_pilxi.Pi_Session.return_value = self.mock_session
 
-    # -- no hardware present --------------------------------------------------
+    def test_no_free_cards_returns_empty_list(self):
+        result = pi.initPXIE()
+        self.assertEqual(result, [])
 
-    def test_no_free_cards_returns_empty_list_and_none(self):
-        mock_base = MagicMock()
-        mock_base.FindFreeCards.return_value = []
-        _fake_pilpxi.Base.return_value = mock_base
+    def test_one_card_returns_three_wave_attributes(self):
+        card = _make_card()
+        self.mock_session.FindFreeCards.return_value = [(1, 2)]
+        self.mock_session.OpenCard.return_value = card
 
-        valid_devices, card = pi.initPXIE()
+        result = pi.initPXIE()
 
-        self.assertEqual(valid_devices, [])
-        self.assertIsNone(card)
+        self.assertEqual(len(result), 3)
+        for wave in result:
+            self.assertIsInstance(wave, pi.waveAtributes)
+            self.assertIs(wave._card, card)
 
-    # -- card ID mismatch -----------------------------------------------------
+    def test_two_cards_return_six_wave_attributes(self):
+        card1, card2 = _make_card(), _make_card()
+        self.mock_session.FindFreeCards.return_value = [(1, 1), (2, 2)]
+        self.mock_session.OpenCard.side_effect = [card1, card2]
 
-    def test_wrong_card_id_excluded_from_valid_devices(self):
-        mock_base = MagicMock()
-        mock_base.FindFreeCards.return_value = [(1, 2)]
-        _fake_pilpxi.Base.return_value = mock_base
+        result = pi.initPXIE()
 
-        probe = MagicMock()
-        probe.CardId.return_value = "41-999,SN123,A"
-        _fake_pilpxi.Pi_Card.return_value = probe
+        self.assertEqual(len(result), 6)
 
-        valid_devices, card = pi.initPXIE()
+    def test_card_channels_are_numbered_1_to_3(self):
+        card = _make_card()
+        self.mock_session.FindFreeCards.return_value = [(1, 1)]
+        self.mock_session.OpenCard.return_value = card
 
-        probe.Close.assert_called_once()
-        self.assertEqual(valid_devices, [])
-        self.assertIsNone(card)
+        result = pi.initPXIE()
 
-    # -- happy path -----------------------------------------------------------
+        self.assertEqual([w.getChannel() for w in result], [1, 2, 3])
 
-    def test_valid_card_returned_and_cleared(self):
-        mock_base = MagicMock()
-        mock_base.FindFreeCards.return_value = [(1, 2)]
-        _fake_pilpxi.Base.return_value = mock_base
+    def test_card_is_cleared_on_open(self):
+        card = _make_card()
+        self.mock_session.FindFreeCards.return_value = [(1, 1)]
+        self.mock_session.OpenCard.return_value = card
 
-        probe = MagicMock()
-        probe.CardId.return_value = "41-620,SN456,B"
-        real_card = MagicMock()
-        _fake_pilpxi.Pi_Card.side_effect = [probe, real_card]
+        pi.initPXIE()
 
-        valid_devices, card = pi.initPXIE()
+        card.ClearCard.assert_called_once()
 
-        self.assertEqual(valid_devices, [(1, 2)])
-        self.assertIs(card, real_card)
-        real_card.ClearCard.assert_called_once()
-        probe.Close.assert_called_once()
+    def test_open_card_error_skips_card(self):
+        self.mock_session.FindFreeCards.return_value = [(1, 2)]
+        self.mock_session.OpenCard.side_effect = _FakePilxiError("open failed")
 
-    def test_only_first_valid_device_is_opened_as_card(self):
-        mock_base = MagicMock()
-        mock_base.FindFreeCards.return_value = [(1, 1), (2, 2)]
-        _fake_pilpxi.Base.return_value = mock_base
+        result = pi.initPXIE()
 
-        probe1, probe2 = MagicMock(), MagicMock()
-        probe1.CardId.return_value = "41-620,SN1,A"
-        probe2.CardId.return_value = "41-620,SN2,B"
-        real_card = MagicMock()
-        _fake_pilpxi.Pi_Card.side_effect = [probe1, probe2, real_card]
+        self.assertEqual(result, [])
 
-        valid_devices, card = pi.initPXIE()
+    def test_first_card_error_still_opens_second(self):
+        card2 = _make_card()
+        self.mock_session.FindFreeCards.return_value = [(1, 1), (2, 2)]
+        self.mock_session.OpenCard.side_effect = [_FakePilxiError("fail"), card2]
 
-        self.assertEqual(valid_devices, [(1, 1), (2, 2)])
-        self.assertIs(card, real_card)
-        # The final Pi_Card call must target the first valid device
-        self.assertEqual(_fake_pilpxi.Pi_Card.call_args_list[-1], call(1, 1))
+        result = pi.initPXIE()
 
-    # -- exception handling ---------------------------------------------------
-
-    def test_pilpxi_error_on_probe_open_skips_device(self):
-        mock_base = MagicMock()
-        mock_base.FindFreeCards.return_value = [(1, 2)]
-        _fake_pilpxi.Base.return_value = mock_base
-
-        _fake_pilpxi.Pi_Card.side_effect = _FakePilpxiError("open failed")
-
-        valid_devices, card = pi.initPXIE()
-
-        self.assertEqual(valid_devices, [])
-        self.assertIsNone(card)
-
-    def test_pilpxi_error_on_real_card_open_returns_none_card(self):
-        mock_base = MagicMock()
-        mock_base.FindFreeCards.return_value = [(3, 4)]
-        _fake_pilpxi.Base.return_value = mock_base
-
-        probe = MagicMock()
-        probe.CardId.return_value = "41-620,SN789,C"
-        _fake_pilpxi.Pi_Card.side_effect = [probe, _FakePilpxiError("card open failed")]
-
-        valid_devices, card = pi.initPXIE()
-
-        # Device was found valid during probing, but card open failed
-        self.assertEqual(valid_devices, [(3, 4)])
-        self.assertIsNone(card)
+        self.assertEqual(len(result), 3)
+        for wave in result:
+            self.assertIs(wave._card, card2)
 
 
 # ── updateWaveform tests ──────────────────────────────────────────────────────
 
 class TestUpdateWaveform(unittest.TestCase):
 
-    # -- guard: card is None --------------------------------------------------
-
     def test_none_card_returns_without_calling_hardware(self):
-        # Should not raise; just prints and returns early
-        pi.updateWaveform(None, 1, 100.0, 1.0, 0.0)
+        wave = _make_wave()
+        pi.updateWaveform(None, wave)  # must not raise
 
-    # -- normal operation -----------------------------------------------------
-
-    def test_valid_call_invokes_all_five_methods_in_order(self):
+    def test_valid_call_invokes_all_pifglx_methods(self):
         card = _make_card()
-        mgr = MagicMock()
-        card.attach_mock(card.PILFG_AbortGeneration,  "PILFG_AbortGeneration")
-        card.attach_mock(card.PILFG_SetWaveform,      "PILFG_SetWaveform")
-        card.attach_mock(card.PILFG_SetAmplitude,     "PILFG_SetAmplitude")
-        card.attach_mock(card.PILFG_SetFrequency,     "PILFG_SetFrequency")
-        card.attach_mock(card.PILFG_SetDcOffset,      "PILFG_SetDcOffset")
-        card.attach_mock(card.PILFG_InitiateGeneration, "PILFG_InitiateGeneration")
+        wave = _make_wave(channel=1, frequency=1000.0, amplitude=2.5,
+                          offset=1.0, phase=45.0)
+        pi.updateWaveform(card, wave)
 
-        pi.updateWaveform(card, 1, 1000.0, 2.5, 1.0)
+        card.PIFGLX_AbortGeneration.assert_called_once_with(1)
+        card.PIFGLX_SetWaveform.assert_called_once()
+        card.PIFGLX_SetAmplitude.assert_called_once_with(1, 2.5)
+        card.PIFGLX_SetFrequency.assert_called_once_with(1, 1000.0)
+        card.PIFGLX_SetDcOffset.assert_called_once_with(1, 1.0)
+        card.PIFGLX_SetStartPhase.assert_called_once_with(1, 45.0)
+        card.PIFGLX_InitiateGeneration.assert_called_once_with(1)
 
-        card.PILFG_AbortGeneration.assert_called_once_with(1)
-        card.PILFG_SetWaveform.assert_called_once_with(1, _fake_pilpxi.FG_WfTypes.PILFG_WAVEFORM_SINE)
-        card.PILFG_SetAmplitude.assert_called_once_with(1, 2.5)
-        card.PILFG_SetFrequency.assert_called_once_with(1, 1000.0)
-        card.PILFG_SetDcOffset.assert_called_once_with(1, 1.0)
-        card.PILFG_InitiateGeneration.assert_called_once_with(1)
-
-    # -- offset boundary checks -----------------------------------------------
-
-    def test_offset_below_minus5_sets_dc_offset_to_zero(self):
+    def test_offset_below_zero_sets_dc_offset_to_zero(self):
         card = _make_card()
-        pi.updateWaveform(card, 2, 500.0, 1.0, -5.1)
-        card.PILFG_SetDcOffset.assert_called_once_with(2, 0)
+        wave = _make_wave(channel=2, offset=-0.1)
+        pi.updateWaveform(card, wave)
+        card.PIFGLX_SetDcOffset.assert_called_once_with(2, 0)
 
-    def test_offset_above_plus5_sets_dc_offset_to_zero(self):
+    def test_offset_above_five_sets_dc_offset_to_zero(self):
         card = _make_card()
-        pi.updateWaveform(card, 2, 500.0, 1.0, 5.1)
-        card.PILFG_SetDcOffset.assert_called_once_with(2, 0)
+        wave = _make_wave(channel=2, offset=5.1)
+        pi.updateWaveform(card, wave)
+        card.PIFGLX_SetDcOffset.assert_called_once_with(2, 0)
 
-    def test_offset_at_exactly_minus5_is_accepted(self):
+    def test_offset_at_zero_is_accepted(self):
         card = _make_card()
-        pi.updateWaveform(card, 1, 100.0, 1.0, -5.0)
-        card.PILFG_SetDcOffset.assert_called_once_with(1, -5.0)
+        wave = _make_wave(offset=0.0)
+        pi.updateWaveform(card, wave)
+        card.PIFGLX_SetDcOffset.assert_called_once_with(1, 0.0)
 
-    def test_offset_at_exactly_plus5_is_accepted(self):
+    def test_offset_at_five_is_accepted(self):
         card = _make_card()
-        pi.updateWaveform(card, 1, 100.0, 1.0, 5.0)
-        card.PILFG_SetDcOffset.assert_called_once_with(1, 5.0)
+        wave = _make_wave(offset=5.0)
+        pi.updateWaveform(card, wave)
+        card.PIFGLX_SetDcOffset.assert_called_once_with(1, 5.0)
 
-    def test_offset_zero_is_accepted(self):
+    def test_pilxi_error_is_caught_and_does_not_propagate(self):
         card = _make_card()
-        pi.updateWaveform(card, 1, 100.0, 1.0, 0.0)
-        card.PILFG_SetDcOffset.assert_called_once_with(1, 0.0)
+        card.PIFGLX_AbortGeneration.side_effect = _FakePilxiError("hardware fault")
+        wave = _make_wave()
+        pi.updateWaveform(card, wave)  # must not raise
+        card.PIFGLX_SetWaveform.assert_not_called()
 
-    # -- exception handling ---------------------------------------------------
-
-    def test_pilpxi_error_during_generation_is_caught(self):
+    def test_pilxi_error_on_initiate_is_caught(self):
         card = _make_card()
-        card.PILFG_AbortGeneration.side_effect = _FakePilpxiError("hardware fault")
-
-        # Must not propagate the exception
-        pi.updateWaveform(card, 1, 100.0, 1.0, 0.0)
-
-        # Nothing after the failing call should have been reached
-        card.PILFG_SetWaveform.assert_not_called()
-
-    def test_pilpxi_error_on_initiate_is_caught(self):
-        card = _make_card()
-        card.PILFG_InitiateGeneration.side_effect = _FakePilpxiError("initiate failed")
-
-        pi.updateWaveform(card, 1, 100.0, 1.0, 0.0)
-
-        # Everything before InitiateGeneration should still have been called
-        card.PILFG_AbortGeneration.assert_called_once()
-        card.PILFG_SetWaveform.assert_called_once()
+        card.PIFGLX_InitiateGeneration.side_effect = _FakePilxiError("initiate failed")
+        wave = _make_wave()
+        pi.updateWaveform(card, wave)  # must not raise
+        card.PIFGLX_AbortGeneration.assert_called_once()
+        card.PIFGLX_SetWaveform.assert_called_once()
 
 
 if __name__ == "__main__":

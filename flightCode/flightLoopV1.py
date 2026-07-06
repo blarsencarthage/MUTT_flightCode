@@ -36,6 +36,16 @@ SERIAL_PORT          = "COM3"      # spacecraft RS-422 bus
 SERIAL_BAUD          = 9600
 RELAY_PORT           = "COM1"      # Numato USB relay board
 RELAY_BAUD           = 19200
+CONFIG_FILE_PATH_1   = "waveConfigs/7.1_WaveConfigs.csv"
+CONFIG_FILE_PATH_2   = "waveConfigs/7.2_WaveConfigs.csv"
+CONFIG_FILE_PATH_3   = "waveConfigs/7.3_WaveConfigs.csv"
+CONFIG_FILE_PATH_4   = "waveConfigs/7.4_WaveConfigs.csv"
+CONFIG_FILE_PATH_5   = "waveConfigs/7.5_WaveConfigs.csv"
+CONFIG_FILE_PATH_6   = "waveConfigs/7.6_WaveConfigs.csv"
+CONFIG_FILE_PATHS    = [
+    CONFIG_FILE_PATH_1, CONFIG_FILE_PATH_2, CONFIG_FILE_PATH_3,
+    CONFIG_FILE_PATH_4, CONFIG_FILE_PATH_5, CONFIG_FILE_PATH_6,
+]
 
 HEARTBEAT_TIMEOUT    = 5.0         # s before a thread is considered stuck
 WATCHDOG_INTERVAL    = 1.0         # s between watchdog passes
@@ -47,8 +57,6 @@ WORKER_GET_TIMEOUT   = 0.2         # s — every queue.get uses this, never bloc
 
 PXI_HEALTH_INTERVAL  = 5.0         # s between PXI connection ping checks
 PXI_REINIT_LIMIT     = 3           # failed reinit attempts before safe mode
-
-
 # ---------------------------------------------------------------------------
 # Shared state — the ONLY mutable state shared across threads
 # ---------------------------------------------------------------------------
@@ -68,7 +76,7 @@ threads        = {}                   # threadName -> live threading.Thread
 
 pxiLock        = threading.Lock()    # protects pxiWaves during watchdog reinit
 pxiReinitCount = 0                   # failed PXI reinit attempts
-
+flightPhase = {"preLaunch": True, "SEP": False, "zgStart": False, "zgStop": False}        # current flight phase (for logging / telemetry)
 
 # ---------------------------------------------------------------------------
 # Hardware handles — populated by initHardware(), consumed by the workers
@@ -77,13 +85,14 @@ pxiWaves      = []     # list of waveAtributes (3 per card) returned by initPXIE
 relaySer      = None   # serial.Serial to the Numato board
 craftListener = None   # craftSerial.RS422 instance
 craftController = None  # relayControls.RelayController instance
-
+waveConfigs = None #After initHardware()
 # ---------------------------------------------------------------------------
 # Experiment state 
 # ---------------------------------------------------------------------------
 relayStates    = [False, False, False, False]
 #If a specifc craft signal has been recived 
 signalStates: dict[str, bool] = {"sep": False , "zgStart": False, "zgStop": False}
+signalBytes: dict[str, bytes] = {"sep": b"SEP", "zgStart":b"ZGST", "zgStop":b"ZGSP"}
 #The time that the signal was recived
 signalTimestamps: dict[str, float] = {"sep": 0.0, "zgStart": 0.0, "zgStop": 0.0}
 # waveform state is carried by each waveAtributes object inside pxiWaves
@@ -92,6 +101,8 @@ signalTimestamps: dict[str, float] = {"sep": 0.0, "zgStart": 0.0, "zgStop": 0.0}
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
+
+
 log = logging.getLogger("flight")
 
 
@@ -194,24 +205,76 @@ def craftSerial_ThreadManager():
 
 
 def pxi_ThreadManager():
-    """LXIWorker: drive the Pickering 60-105 / 41-620 function generators."""
+    """LXIWorker: step through all 6 waveform configurations sequentially.
+
+    Waits for zgStart, then for each configuration:
+      1. Applies all 6 waveforms via updateWaveform.
+      2. Runs for activeTime seconds.
+      3. Aborts all generators.
+      4. Waits settlingTime seconds before starting the next configuration.
+
+    Cards come from pxiWaves (hardware handles set by initPXIE).
+    Parameters come from waveConfigs (loaded from CSV). Both are indexed
+    the same way, so pxiWaves[j] drives waveConfigs[i][j].
+    """
     name = "PXI"
-    while not stopEvent.is_set():
-        try:
-            cmd = pxiQueue.get(timeout=WORKER_GET_TIMEOUT)
-            # TODO: parse cmd -> wave index + new parameters, then:
-            #   with pxiLock:
-            #       wave = pxiWaves[idx]
-            #       wave.setFrequency(...); wave.setAmplitude(...); etc.
-            #       PI.updateWaveform(wave._card, wave)
-            # Acquire pxiLock around any pxiWaves access — the watchdog may
-            # replace the list during a reinit.
-            logMsg("INFO", f"{name} handling: {cmd!r}")
-        except queue.Empty:
-            pass
-        except Exception as e:
-            logMsg("ERROR", f"{name} worker error: {e}")
+
+    # Idle until the zero-g phase begins.
+    while not stopEvent.is_set() and not flightPhase["zgStart"]:
         updateHeartbeat(name)
+        stopEvent.wait(WORKER_GET_TIMEOUT)
+
+    for i, config in enumerate(waveConfigs):
+        if stopEvent.is_set():
+            break
+
+        # Apply all 6 waveforms for this configuration.
+        with pxiLock:
+            for j, wave in enumerate(config):
+                try:
+                    PI.updateWaveform(pxiWaves[j]._card, wave)
+                except Exception as e:
+                    logMsg("ERROR", f"{name} config {i+1} updateWaveform[{j}] failed: {e}")
+
+        logMsg("INFO", f"{name} config {i+1} active — running for {config[0].getActiveTime()}s")
+
+        # Wait activeTime in small chunks so the watchdog heartbeat stays fresh.
+        deadline = time.monotonic() + config[0].getActiveTime()
+        while not stopEvent.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            stopEvent.wait(min(WORKER_GET_TIMEOUT, remaining))
+            updateHeartbeat(name)
+
+        if stopEvent.is_set():
+            break
+
+        # Abort all generators before the settling window.
+        with pxiLock:
+            for j, wave in enumerate(config):
+                try:
+                    pxiWaves[j]._card.PIFGLX_AbortGeneration(wave.getChannel())
+                except Exception as e:
+                    logMsg("ERROR", f"{name} config {i+1} AbortGeneration[{j}] failed: {e}")
+
+        logMsg("INFO", f"{name} config {i+1} settling — waiting {config[0].getSettlingTime()}s")
+
+        # Wait settlingTime, same heartbeat pattern.
+        deadline = time.monotonic() + config[0].getSettlingTime()
+        while not stopEvent.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            stopEvent.wait(min(WORKER_GET_TIMEOUT, remaining))
+            updateHeartbeat(name)
+
+    logMsg("INFO", f"{name} all configurations complete")
+
+    # Hold heartbeat alive until the global shutdown.
+    while not stopEvent.is_set():
+        updateHeartbeat(name)
+        stopEvent.wait(WORKER_GET_TIMEOUT)
 
 
 def relay_ThreadManager():
@@ -475,12 +538,14 @@ def initHardware():
     Returns True on success. Failures are logged; decide per-device whether a
     failure is fatal as the self-checks are fleshed out.
     """
-    global pxiWaves, relaySer, craftListener, relayController
+    global pxiWaves, relaySer, craftListener, craftController, waveConfigs
     ok = True
 
     # --- Pickering PXI cabinet + function-generator self-check ---
     try:
         pxiWaves = PI.initPXIE()
+        waveConfigs = PI.readAllConfigs(CONFIG_FILE_PATHS)
+
         # TODO: PI.waveformSelfCheck([w._card for w in pxiWaves]) and act on the result
     except Exception as e:
         logMsg("ERROR", f"PXI init failed: {e}")
@@ -497,7 +562,7 @@ def initHardware():
         ok = False
     # --- Relay controller Opening ---
     try:
-        relayController = relayControls.RelayController(port = RELAY_PORT, baud = RELAY_BAUD)
+        craftController = relayControls.RelayController(port = RELAY_PORT, baud = RELAY_BAUD)
     except Exception as e:
         logMsg("ERROR", f"Relay controller init failed: {e}")
         ok = False

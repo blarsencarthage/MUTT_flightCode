@@ -4,25 +4,37 @@
 #Updated 6.23.26
 import os
 import sys
+import csv
 _pkg_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_pkg_dir, "pilxi-5.7"))
-#TODO: Revise waveAtributes class to include the card address and channel number, bring 
+#TODO: Revise waveAtributes class to include the card address and channel number, bring
 #updateWaveform into the class and have it run whenever any of the set functions are run.
 import pilxi
 import pi620lx
 
+_WAVEFORM_TYPE_MAP = {
+    "SINE":     pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE,
+    "SQUARE":   pilxi.WaveformTypes.PIFGLX_WAVEFORM_SQUARE,
+    "TRIANGLE": pilxi.WaveformTypes.PIFGLX_WAVEFORM_TRIANGLE,
+    "RAMP":     pilxi.WaveformTypes.PIFGLX_WAVEFORM_RAMP,
+    "PULSE":    pilxi.WaveformTypes.PIFGLX_WAVEFORM_PULSE,
+}
+
 class waveAtributes:
     """Stores all parameters that describe a single waveform channel output."""
 
-    def __init__(self, channel, card: pilxi.Pi_Card_ByDevice, frequency, amplitude, offset, phase=0.0,
-                 waveform_type=pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE):
+    def __init__(self, channel, frequency, amplitude, offset, card=None, phase=0.0,
+                 waveform_type=pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE,
+                 activeTime=0.0, settlingTime=0.0):
         self._channel = channel
         self._card = card
         self._frequency = frequency
         self._amplitude = amplitude
         self._offset = offset
         self._phase = phase % 360.0
-        self._waveform_type = waveform_type #Will always be a sin wave, requires mods to be otherwise
+        self._waveform_type = waveform_type
+        self._activeTime = activeTime    # seconds the waveform is actively driven
+        self._settlingTime = settlingTime  # seconds allowed for signal to settle
 
     # --- channel ---
     def getChannel(self):
@@ -66,11 +78,68 @@ class waveAtributes:
     def setWaveformType(self, waveform_type):
         self._waveform_type = waveform_type
 
+    # --- activeTime ---
+    def getActiveTime(self):
+        return self._activeTime
+
+    def setActiveTime(self, activeTime):
+        self._activeTime = activeTime
+
+    # --- settlingTime ---
+    def getSettlingTime(self):
+        return self._settlingTime
+
+    def setSettlingTime(self, settlingTime):
+        self._settlingTime = settlingTime
+
     def __repr__(self):
         return (f"waveAtributes(channel={self._channel}, frequency={self._frequency}, "
                 f"amplitude={self._amplitude}, offset={self._offset}, "
-                f"phase={self._phase}, waveform_type={self._waveform_type})")
+                f"phase={self._phase}, waveform_type={self._waveform_type}, "
+                f"activeTime={self._activeTime}, settlingTime={self._settlingTime})")
 
+
+def readConfigs(configFilePath):
+    """Read waveform configurations from a CSV file.
+
+    Expected CSV columns (header row required):
+        channel, frequency, amplitude, offset, phase, waveform_type, activeTime, settlingTime
+
+    Returns a list of waveAtributes objects with card=None.
+    Assign card handles after hardware is initialized.
+    """
+    waveforms = []
+    with open(configFilePath, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            wf_key = row["waveform_type"].strip().upper()
+            wf_type = _WAVEFORM_TYPE_MAP.get(wf_key, pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE)
+            wave = waveAtributes(
+                channel=int(row["channel"]),
+                frequency=float(row["frequency"]),
+                amplitude=float(row["amplitude"]),
+                offset=float(row["offset"]),
+                phase=float(row["phase"]),
+                waveform_type=wf_type,
+                activeTime=float(row["activeTime"]),
+                settlingTime=float(row["settlingTime"]),
+            )
+            waveforms.append(wave)
+    return waveforms
+
+
+def readAllConfigs(configFilePaths):
+    """Read multiple waveform configuration CSV files.
+
+    Args:
+        configFilePaths: ordered list of CSV file paths, one per configuration.
+
+    Returns:
+        list[list[waveAtributes]] — one inner list of 6 waveAtributes per config,
+        in the same order as configFilePaths. card=None on every entry; assign
+        card handles after initPXIE() returns.
+    """
+    return [readConfigs(path) for path in configFilePaths]
 
 
 def initPXIE(ip_address="pxi"):
@@ -86,10 +155,10 @@ def initPXIE(ip_address="pxi"):
 
     freeCards = session.FindFreeCards() #Returns a list of tuples (bus, device) for each free card found.
 
-    cards = [] 
+    cards = []
     for bus, device in freeCards: #Opens sessions with each free card and appends them to the cards list.
-        try: # NOTE: As long as the session with the LXI is open, the card will remain open. 
-            card = session.OpenCard(bus, device) #Returns a Pi_Card_ByDevice object 
+        try: # NOTE: As long as the session with the LXI is open, the card will remain open.
+            card = session.OpenCard(bus, device) #Returns a Pi_Card_ByDevice object
             card.ClearCard()
             cards.append(card)
         except pilxi.Error as ex:
@@ -244,12 +313,12 @@ def waveformSelfCheck(cards):
 def buildWaveforms(cardArray):
     """"
     Builds a list of 6 waveAtributes objects, 3 per card.
-    
-    """   
+
+    """
     waveforms = []
     for card in cardArray:
-        for channel in range(1, 4): #Using 3 channels per card  
+        for channel in range(1, 4): #Using 3 channels per card
             wave = waveAtributes(channel=channel, card=card, frequency=0, amplitude=0, offset=0)
             waveforms.append(wave)
+    return waveforms
 
-    

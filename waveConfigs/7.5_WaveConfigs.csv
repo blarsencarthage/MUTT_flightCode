@@ -1,0 +1,7 @@
+channel,frequency,amplitude,offset,phase,waveform_type,activeTime,settlingTime
+1,400.0,2.5,2.5,0.0,SINE,18.0,3.0
+2,800.0,2.5,2.5,0.0,SINE,18.0,3.0
+3,1000.0,2.5,2.5,0.0,SINE,18.0,3.0
+1,400.0,2.5,2.5,0.0,SINE,18.0,3.0
+2,800.0,2.5,2.5,0.0,SINE,18.0,3.0
+3,1000.0,2.5,2.5,0.0,SINE,18.0,3.0

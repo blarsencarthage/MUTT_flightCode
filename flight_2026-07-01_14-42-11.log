@@ -1,0 +1,59 @@
+2026-07-01 14:42:11,313 [FlightMain] INFO: Flight controller starting
+2026-07-01 14:42:11,434 [rs422-reader] INFO: Reader: connected to COM3
+2026-07-01 14:42:11,434 [FlightMain] INFO: RS422 listener started on COM3 @ 9600 baud
+2026-07-01 14:42:11,436 [TELEM] WARNING: PXI health check: no waves registered
+2026-07-01 14:42:11,442 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-01 14:42:11,479 [TELEM] WARNING: PXI reinit attempt 1
+2026-07-01 14:42:12,437 [TELEM] ERROR: Watchdog died — restarting
+2026-07-01 14:42:12,439 [TELEM] WARNING: PXI health check: no waves registered
+2026-07-01 14:42:12,440 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-01 14:42:12,445 [TELEM] WARNING: PXI reinit attempt 2
+2026-07-01 14:42:13,438 [TELEM] ERROR: Watchdog died — restarting
+2026-07-01 14:42:13,444 [TELEM] WARNING: PXI health check: no waves registered
+2026-07-01 14:42:13,455 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-01 14:42:13,460 [TELEM] WARNING: PXI reinit attempt 3
+2026-07-01 14:42:14,439 [TELEM] ERROR: Watchdog died — restarting
+2026-07-01 14:42:14,444 [TELEM] WARNING: PXI health check: no waves registered
+2026-07-01 14:42:14,446 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-01 14:42:14,450 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — safe mode
+2026-07-01 14:42:14,454 [TELEM] CRITICAL: ENTERING SAFE MODE
+2026-07-01 14:42:14,458 [TELEM] INFO: Safe mode: relays opened
+2026-07-01 14:42:14,461 [TELEM] INFO: Safe mode: PXI outputs zeroed
+2026-07-01 14:42:14,464 [TELEM] INFO: Safe mode: fault signalled to spacecraft
+2026-07-01 14:42:19,442 [TELEM] WARNING: PXI health check: no waves registered
+2026-07-01 14:42:19,443 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-01 14:42:19,444 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — safe mode
+2026-07-01 14:42:24,444 [TELEM] WARNING: PXI health check: no waves registered
+2026-07-01 14:42:24,445 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-01 14:42:24,446 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — safe mode
+2026-07-01 14:42:29,446 [TELEM] WARNING: PXI health check: no waves registered
+2026-07-01 14:42:29,448 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-01 14:42:29,451 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — safe mode
+2026-07-01 14:42:30,303 [TELEM] ERROR: PXI config 1 updateWaveform[0] failed: 'NoneType' object is not subscriptable
+2026-07-01 14:42:30,305 [TELEM] ERROR: PXI config 1 updateWaveform[1] failed: 'NoneType' object is not subscriptable
+2026-07-01 14:42:30,306 [TELEM] ERROR: PXI config 1 updateWaveform[2] failed: 'NoneType' object is not subscriptable
+2026-07-01 14:42:30,307 [TELEM] ERROR: PXI config 1 updateWaveform[3] failed: 'NoneType' object is not subscriptable
+2026-07-01 14:42:30,310 [TELEM] ERROR: PXI config 1 updateWaveform[4] failed: 'NoneType' object is not subscriptable
+2026-07-01 14:42:30,314 [TELEM] ERROR: PXI config 1 updateWaveform[5] failed: 'NoneType' object is not subscriptable
+2026-07-01 14:42:30,317 [TELEM] INFO: PXI config 1 active — running for 240.0s
+2026-07-01 14:42:34,449 [TELEM] WARNING: PXI health check: no waves registered
+2026-07-01 14:42:34,450 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-01 14:42:34,451 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — safe mode
+2026-07-01 14:42:39,452 [TELEM] WARNING: PXI health check: no waves registered
+2026-07-01 14:42:39,454 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-01 14:42:39,457 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — safe mode
+2026-07-01 14:42:44,454 [TELEM] WARNING: PXI health check: no waves registered
+2026-07-01 14:42:44,455 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-01 14:42:44,456 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — safe mode
+2026-07-01 14:42:49,456 [TELEM] WARNING: PXI health check: no waves registered
+2026-07-01 14:42:49,457 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-01 14:42:49,459 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — safe mode
+2026-07-01 14:42:54,458 [TELEM] WARNING: PXI health check: no waves registered
+2026-07-01 14:42:54,459 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-01 14:42:54,460 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — safe mode
+2026-07-01 14:42:59,460 [TELEM] WARNING: PXI health check: no waves registered
+2026-07-01 14:42:59,462 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-01 14:42:59,464 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — safe mode
+2026-07-01 14:43:04,462 [TELEM] WARNING: PXI health check: no waves registered
+2026-07-01 14:43:04,463 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-01 14:43:04,464 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — safe mode
