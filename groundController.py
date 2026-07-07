@@ -155,7 +155,7 @@ def configureLogging():
     ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     fmt = logging.Formatter(
         "%(asctime)s [%(threadName)s] %(levelname)s: %(message)s")
-    fh = logging.FileHandler(f"ground_{ts}.log")
+    fh = logging.FileHandler(f"groundLog\ground_{ts}.log")
     fh.setFormatter(fmt)
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)

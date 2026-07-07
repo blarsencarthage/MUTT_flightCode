@@ -1,4 +1,0 @@
-2026-07-01 14:51:24,597 [FlightMain] INFO: Flight controller starting
-2026-07-01 14:51:24,733 [rs422-reader] INFO: Reader: connected to COM3
-2026-07-01 14:51:24,734 [FlightMain] INFO: RS422 listener started on COM3 @ 9600 baud
-2026-07-01 14:51:50,354 [TELEM] INFO: PXI config 1 active — running for 240.0s
