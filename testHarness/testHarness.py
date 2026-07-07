@@ -1,7 +1,7 @@
 """testHarness.py — MUTT Virtual Test Harness (tkinter GUI).
 
 Patches pilxi, pi620lx, and serial into sys.modules BEFORE importing any
-flight code, then runs flightLoopV1.main() in a background daemon thread.
+flight code, then runs flightController.main() in a background daemon thread.
 
 The GUI lets the operator:
   - Inject 85-byte craft signal frames (manual or auto at a set interval)
@@ -25,13 +25,10 @@ import types
 import tkinter as tk
 from tkinter import scrolledtext
 
-# ── repo root and relay subpackage on sys.path ───────────────────────────────
+# ── repo root on sys.path ────────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_HERE)
 sys.path.insert(0, _REPO)
-# flightLoopV1 does `import RelayCode` (bare name); RelayCode.py lives in
-# relayControls/, so add that directory so the bare import resolves.
-sys.path.insert(0, os.path.join(_REPO, "relayControls"))
 
 # ── inject virtual hardware into sys.modules BEFORE any flight-code import ───
 from testHarness.virtualHardware import (
@@ -56,7 +53,7 @@ sys.modules["serial"]          = VIRTUAL_SERIAL
 sys.modules["serial.serialutil"] = types.ModuleType("serial.serialutil")
 
 # ── now safe to import flight code ───────────────────────────────────────────
-import flightCode.flightLoopV1 as flightLoop  # noqa: E402
+import flightCode.flightController as flightLoop  # noqa: E402
 
 # ── post-import fixups ───────────────────────────────────────────────────────
 

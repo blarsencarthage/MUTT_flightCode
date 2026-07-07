@@ -13,11 +13,16 @@ import pilxi
 import pi620lx
 
 _WAVEFORM_TYPE_MAP = {
-    "SINE":     pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE,
-    "SQUARE":   pilxi.WaveformTypes.PIFGLX_WAVEFORM_SQUARE,
-    "TRIANGLE": pilxi.WaveformTypes.PIFGLX_WAVEFORM_TRIANGLE,
-    "RAMP":     pilxi.WaveformTypes.PIFGLX_WAVEFORM_RAMP,
-    "PULSE":    pilxi.WaveformTypes.PIFGLX_WAVEFORM_PULSE,
+    "SINE":      pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE,
+    "SQUARE":    pilxi.WaveformTypes.PIFGLX_WAVEFORM_SQUARE,
+    "TRIANGLE":  pilxi.WaveformTypes.PIFGLX_WAVEFORM_TRIANGLE,
+    "RAMP":      pilxi.WaveformTypes.PIFGLX_WAVEFORM_RAMP_UP,
+    "RAMP_UP":   pilxi.WaveformTypes.PIFGLX_WAVEFORM_RAMP_UP,
+    "RAMP_DOWN": pilxi.WaveformTypes.PIFGLX_WAVEFORM_RAMP_DOWN,
+    "DC":        pilxi.WaveformTypes.PIFGLX_WAVEFORM_DC,
+    "PULSE":     pilxi.WaveformTypes.PIFGLX_WAVEFORM_PULSE,
+    "PWM":       pilxi.WaveformTypes.PIFGLX_WAVEFORM_PWM,
+    "ARB":       pilxi.WaveformTypes.PIFGLX_WAVEFORM_ARB,
 }
 
 class waveAtributes:

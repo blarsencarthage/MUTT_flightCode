@@ -8,7 +8,7 @@ Cycles through relays 0-3 one at a time
 
 import time
 import logging
-from RelayCode import RelayController, numRelays
+from relayControls.relaySerial import RelayController, numRelays
 
 # ---------------------------------------------------------------------------
 # Test configuration

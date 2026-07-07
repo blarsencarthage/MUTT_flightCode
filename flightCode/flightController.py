@@ -1,4 +1,4 @@
-"""flightLoopV1 — suborbital experiment flight controller (threading framework).
+"""flightController — suborbital experiment flight controller (threading framework).
 
 First-pass threading implementation per CLAUDE.md. Each hardware device gets a
 dedicated always-on worker thread. Threads talk only through queues. A watchdog
@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pickeringControls.pickeringInterface as PI
 import spacecraftSerial.RS422 as craftSerial
-import RelayCode as relayControls
+import relayControls.relaySerial as relayControls
 
 # ---------------------------------------------------------------------------
 # Tunable constants  (SCREAMING_SNAKE kept — idiomatic for module constants)
@@ -103,7 +103,7 @@ signalTimestamps: dict[str, float] = {"sep": 0.0, "zgStart": 0.0, "zgStop": 0.0}
 # ---------------------------------------------------------------------------
 
 
-log = logging.getLogger("flight")
+log = logging.getLogger("mutt")
 
 
 def configureLogging():

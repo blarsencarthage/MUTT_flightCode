@@ -40,12 +40,8 @@ numRelays = 4                 # Numato USB relay board has relays 0-3
 # Logging
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)-8s] %(threadName)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger(__name__)
+
+log = logging.getLogger("mutt.relaySerial")
 
 
 # ---------------------------------------------------------------------------
@@ -267,34 +263,34 @@ class RelayController:
 # Example / demo entry-point
 # ---------------------------------------------------------------------------
 
-def main():
-    controller = RelayController(port=portName, baud=baudRate)
-    controller.start()
+    # def main():
+    #     controller = RelayController(port=portName, baud=baudRate)
+    #     controller.start()
 
-    try:
-        log.info("=== Demo: cycling each relay ON then OFF ===")
+    #     try:
+    #         log.info("=== Demo: cycling each relay ON then OFF ===")
 
-        for relayNum in range(numRelays):
-            log.info("--- Relay %d: ON ---", relayNum)
-            controller.signalRelayOn(relayNum)
-            time.sleep(1.5)
+    #         for relayNum in range(numRelays):
+    #             log.info("--- Relay %d: ON ---", relayNum)
+    #             controller.signalRelayOn(relayNum)
+    #             time.sleep(1.5)
 
-            log.info("--- Relay %d: OFF ---", relayNum)
-            controller.signalRelayOff(relayNum)
-            time.sleep(0.75)
+    #             log.info("--- Relay %d: OFF ---", relayNum)
+    #             controller.signalRelayOff(relayNum)
+    #             time.sleep(0.75)
 
-        log.info("Demo complete. Press Ctrl+C to exit.")
-        while True:
-            time.sleep(1.0)
+    #         log.info("Demo complete. Press Ctrl+C to exit.")
+    #         while True:
+    #             time.sleep(1.0)
 
-    except KeyboardInterrupt:
-        log.info("Interrupt received — shutting down.")
-    finally:
-        controller.stop()
+    #     except KeyboardInterrupt:
+    #         log.info("Interrupt received — shutting down.")
+    #     finally:
+    #         controller.stop()
 
 
-if __name__ == "__main__":
-    main()
+    # if __name__ == "__main__":
+    #     main()
 
 
 

@@ -5,7 +5,8 @@ import time
 import queue
 import threading
 import serial  # pip install pyserial
-
+import logging 
+log = logging.getLogger("mutt.craftSerial")
 
 PORT            = "COM3"             # Advantech COM port: COM-1 or COM-2
 BAUD            = 6800               # bit/sec
@@ -49,14 +50,16 @@ class serialCraftInterface():
 
         threading.Thread(target=self._reader,    daemon=True).start()
         threading.Thread(target=self._processor, daemon=True).start()
-
+        log.info("Serial Craft Interface initialized")
     # --- private ---
 
     def _openPort(self) -> serial.Serial:
+        log.info(f"Opening serial port {PORT} at {BAUD} baud")
         return serial.Serial(
             port=PORT, baudrate=BAUD, bytesize=BYTESIZE,
             parity=PARITY, stopbits=STOPBITS, timeout=READ_TIMEOUT,
         )
+        
 
     #TODO: Add logging to note craft connection and DC
     def _reader(self):
@@ -69,11 +72,14 @@ class serialCraftInterface():
                     data = comm.read(1024)
                     if data:
                         self._segments.put(data)
+                        log.info(f"Read {len(data)} bytes from serial port")
             except serial.SerialException:
+                log.warning("Serial connection error, waiting to reconnect")
                 time.sleep(RECONNECT_DELAY)
             finally:
                 if comm is not None and comm.is_open:
                     comm.close()
+                log.info("Serial port closed, sleeping")
                 time.sleep(RECONNECT_DELAY)
 
     def _processor(self):
@@ -84,8 +90,10 @@ class serialCraftInterface():
                 buffer.extend(chunk)
                 if len(buffer) > MAX_BUFFER:
                     buffer = buffer[-MAX_BUFFER:]
+                    log.warning("Buffer exceeded max size, discarding oldest data")
                 self._scan(buffer)
             except queue.Empty:
+                log.warning("Processor Queue Empty")
                 pass
 
     def _scan(self, buffer: bytearray):
@@ -94,6 +102,7 @@ class serialCraftInterface():
             return
 
         if len(buffer) < idx + PACKET_LENGTH:
+            log.info("Incomplete packet in buffer, waiting for more data")
             return   # full packet not yet in buffer
 
         raw_bits: list[bool] = []
@@ -116,4 +125,5 @@ class serialCraftInterface():
 
     def getSignalBits(self, timeout: float = 5.0) -> dict[str, bool]:
         """Block until the next parsed packet arrives and return its signal states."""
+        log.info("Signal Bits Requested")
         return self._results.get(timeout=timeout)
