@@ -26,7 +26,7 @@ import logging
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pickeringControls.pickeringInterface as PI
-import spacecraftSerial.RS422 as craftSerial
+import spacecraftSerial.craftSerial as craftSerial
 import relayControls.relaySerial as relayControls
 
 # ---------------------------------------------------------------------------
@@ -183,25 +183,42 @@ def routeCommand(cmd):
 def craftSerial_ThreadManager():
     """SerialRX + dispatch: read the spacecraft bus and route commands.
 
-    The RS422 listener owns its own reader/processor threads, so here we poll
-    its registered signals and forward anything detected into routeCommand().
+    The RS422 listener owns its own reader/processor threads. Each call to
+    getSignalBits() blocks up to WORKER_GET_TIMEOUT waiting for the next
+    parsed packet; queue.Empty means no packet arrived this cycle.
     """
     name = "SERIAL"
-    
+
     while not stopEvent.is_set():
         try:
+            signals = craftListener.getSignalBits(timeout=WORKER_GET_TIMEOUT)
+            now = time.monotonic()
 
-            # TODO: replace with the real signal set / read API once defined.
-            #   e.g. for sig in ("launch", "abort"):
-            #            value = craftListener.detected(sig)
-            #            if value:
-            #                routeCommand(value)
-            pass
+            if signals.get("release") and not signalStates["sep"]:
+                signalStates["sep"] = True
+                signalTimestamps["sep"] = now
+                flightPhase["SEP"] = True
+                flightPhase["preLaunch"] = False
+                logMsg("INFO", f"{name}: SEP (release) signal detected")
+
+            if signals.get("microgravityStart") and not signalStates["zgStart"]:
+                signalStates["zgStart"] = True
+                signalTimestamps["zgStart"] = now
+                flightPhase["zgStart"] = True
+                logMsg("INFO", f"{name}: zgStart (microgravityStart) signal detected")
+
+            if signals.get("microgravityEnd") and not signalStates["zgStop"]:
+                signalStates["zgStop"] = True
+                signalTimestamps["zgStop"] = now
+                flightPhase["zgStop"] = True
+                logMsg("INFO", f"{name}: zgStop (microgravityEnd) signal detected")
+
+        except queue.Empty:
+            pass   # no packet this cycle — normal during idle periods
         except Exception as e:
             logMsg("ERROR", f"{name} worker error: {e}")
             time.sleep(0.5)   # back-off so a dead port can't spin the CPU
         updateHeartbeat(name)
-        time.sleep(WORKER_GET_TIMEOUT)
 
 
 def pxi_ThreadManager():
@@ -278,8 +295,12 @@ def pxi_ThreadManager():
 
 
 def relay_ThreadManager():
+    #TODO: impliment relay control to react to changing flight phases and have staged power on of subsystems and staged power off
     """RelayWorker: drive the Numato USB relay board (ASCII serial protocol)."""
     name = "RELAY"
+    while not stopEvent.is_set() and not flightPhase["SEP"]:
+        updateHeartbeat(name)
+        stopEvent.wait(WORKER_GET_TIMEOUT)
     while not stopEvent.is_set():
         try:
             cmd = relayQueue.get(timeout=WORKER_GET_TIMEOUT)
@@ -554,9 +575,7 @@ def initHardware():
 
     # --- Spacecraft RS-422 listener ---
     try:
-        craftListener = craftSerial.RS422(port=SERIAL_PORT, baud=SERIAL_BAUD)
-        # TODO: craftListener.addSignal(...) for each flight command
-        craftListener.start()
+        craftListener = craftSerial.serialCraftInterface()
     except Exception as e:
         logMsg("ERROR", f"Craft serial init failed: {e}")
         ok = False

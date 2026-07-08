@@ -11,7 +11,8 @@ sys.path.insert(0, os.path.join(_pkg_dir, "pilxi-5.7"))
 #updateWaveform into the class and have it run whenever any of the set functions are run.
 import pilxi
 import pi620lx
-
+import logging
+log = logging.getLogger("mutt.LXI")
 _WAVEFORM_TYPE_MAP = {
     "SINE":      pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE,
     "SQUARE":    pilxi.WaveformTypes.PIFGLX_WAVEFORM_SQUARE,
@@ -130,6 +131,7 @@ def readConfigs(configFilePath):
                 settlingTime=float(row["settlingTime"]),
             )
             waveforms.append(wave)
+            log.info(f"Read waveform config: {wave}")
     return waveforms
 
 
@@ -153,10 +155,10 @@ def initPXIE(ip_address="pxi"):
     session = pilxi.Pi_Session(ip_address)
 
     if session is None:
-        print("Failed to initialize PXI interface.")
+        log.error("Failed to initialize PXI interface.")
         return None
     else:
-        print("PXI interface initialized successfully.")
+        log.info("PXI interface initialized successfully.")
 
     freeCards = session.FindFreeCards() #Returns a list of tuples (bus, device) for each free card found.
 
@@ -167,16 +169,15 @@ def initPXIE(ip_address="pxi"):
             card.ClearCard()
             cards.append(card)
         except pilxi.Error as ex:
-            print("Exception occurred:", ex.message)
-
-    print(f"Found {len(cards)} valid cards.")
+            log.error("Exception occurred: %s", ex.message)
+    log.info(f"Found {len(cards)} valid cards.")
     cardWaves = buildWaveforms(cards)
     return cardWaves
 
 
 def updateWaveform(card, wave: waveAtributes):
     if card is None:
-        print("No card available.")
+        log.error("No card available.")
         return
     channel   = wave.getChannel()
     frequency = wave.getFrequency()
@@ -185,21 +186,21 @@ def updateWaveform(card, wave: waveAtributes):
     phase     = wave.getPhase()
     wf_type   = wave.getWaveformType()
     try:
-        print(f"Updating waveform on card {card.CardId()}, channel {channel}: "
-              f"frequency={frequency}, amplitude={amplitude}, offset={offset}, phase={phase}")
+        log.info(f"Updating waveform on card {card.CardId()}, channel {channel}: "
+                 f"frequency={frequency}, amplitude={amplitude}, offset={offset}, phase={phase}")
         card.PIFGLX_AbortGeneration(channel)
         card.PIFGLX_SetWaveform(channel, wf_type)
         card.PIFGLX_SetAmplitude(channel, amplitude)
         card.PIFGLX_SetFrequency(channel, frequency)
         if offset < 0 or offset > 5:
-            print("Offset voltage must be between 0 and 5 volts.")
+            log.warning("Offset voltage must be between 0 and 5 volts.")
             card.PIFGLX_SetDcOffset(channel, 0)
         else:
             card.PIFGLX_SetDcOffset(channel, offset)
         card.PIFGLX_SetStartPhase(channel, phase)
         card.PIFGLX_InitiateGeneration(channel)
     except pilxi.Error as error:
-        print("Exception occurred:", error.message)
+        log.error("Exception occurred: %s", error.message)
 
 def waveformSelfCheck(cards):
     """
@@ -221,13 +222,14 @@ def waveformSelfCheck(cards):
     TEST_PHASE     = 45.0     # Degrees
     TOLERANCE      = 0.01     # Acceptable difference for float comparisons
 
-    print("=== Waveform Generator Self-Check ===")
+    log.info("=== Waveform Generator Self-Check ===")
 
     if not cards:
-        print("No cards provided — nothing to check.")
+        log.info("No cards provided — nothing to check.")
         return {"passed": [], "failed": []}
 
-    print(f"Cards received: {len(cards)}")
+    log.info(f"Cards received: {len(cards)}")
+    log.info(f"Waveform self-check started for {len(cards)} cards.")
 
     passed = []
     failed = []
@@ -239,11 +241,11 @@ def waveformSelfCheck(cards):
         try:
             card_id = card.CardId()
         except pilxi.Error as ex:
-            print(f"\n  {card_label}: FAILED — could not read CardId ({ex.message})")
+            log.error(f"\n  {card_label}: FAILED — could not read CardId ({ex.message})")
             failed.append((i + 1, "Unknown", f"CardId read failed: {ex.message}"))
             continue
 
-        print(f"\n  {card_label} [{card_id}]")
+        log.info(f"\n  {card_label} [{card_id}]")
 
         # --- Write test values ---
         try:
@@ -255,7 +257,7 @@ def waveformSelfCheck(cards):
             card.PIFGLX_SetStartPhase(TEST_CHANNEL, TEST_PHASE)
             card.PIFGLX_InitiateGeneration(TEST_CHANNEL)
         except pilxi.Error as ex:
-            print(f"    FAILED — could not write test values ({ex.message})")
+            log.error(f"    FAILED — could not write test values ({ex.message})")
             failed.append((i + 1, card_id, f"Write failed: {ex.message}"))
             continue
 
@@ -266,12 +268,12 @@ def waveformSelfCheck(cards):
             read_offset = card.PIFGLX_GetDcOffset(TEST_CHANNEL)
             read_phase  = card.PIFGLX_GetStartPhase(TEST_CHANNEL)
         except pilxi.Error as ex:
-            print(f"    FAILED — could not read back values ({ex.message})")
+            log.error(f"    FAILED — could not read back values ({ex.message})")
             failed.append((i + 1, card_id, f"Read failed: {ex.message}"))
             continue
 
-        print(f"    {'Attribute':<12} {'Set':>10}  {'Read':>10}  {'Match':>6}")
-        print(f"    {'-'*44}")
+        log.info(f"    {'Attribute':<12} {'Set':>10}  {'Read':>10}  {'Match':>6}")
+        log.info(f"    {'-'*44}")
 
         mismatches = []
         checks = [
@@ -283,35 +285,35 @@ def waveformSelfCheck(cards):
         for name, expected, actual, unit in checks:
             ok = abs(actual - expected) <= TOLERANCE
             status = "OK" if ok else "FAIL"
-            print(f"    {name:<12} {expected:>9.3f}  {actual:>9.3f}  {status:>6}  {unit}")
+            log.info(f"    {name:<12} {expected:>9.3f}  {actual:>9.3f}  {status:>6}  {unit}")
             if not ok:
                 mismatches.append(f"{name}: expected {expected} {unit}, got {actual} {unit}")
 
         if mismatches:
             reason = "; ".join(mismatches)
-            print(f"    Result: FAILED ({len(mismatches)} mismatch(es))")
+            log.error(f"    Result: FAILED ({len(mismatches)} mismatch(es))")
             failed.append((i + 1, card_id, reason))
         else:
-            print(f"    Result: PASSED")
+            log.info(f"    Result: PASSED")
             passed.append((i + 1, card_id))
 
     # --- Summary ---
-    print(f"\n=== Summary ===")
-    print(f"  Total checked : {len(cards)}")
-    print(f"  Passed        : {len(passed)}")
-    print(f"  Failed        : {len(failed)}")
+    log.info(f"\n=== Summary ===")
+    log.info(f"  Total checked : {len(cards)}")
+    log.info(f"  Passed        : {len(passed)}")
+    log.info(f"  Failed        : {len(failed)}")
 
     if passed:
-        print("\nPassed:")
+        log.info(f"\nPassed:")
         for idx, cid in passed:
-            print(f"  Card {idx}: {cid}")
+            log.info(f"  Card {idx}: {cid}")
 
     if failed:
-        print("\nFailed:")
+        log.info(f"\nFailed:")
         for entry in failed:
             idx, cid = entry[0], entry[1]
             reason = entry[2] if len(entry) > 2 else "unknown"
-            print(f"  Card {idx}: {cid} — {reason}")
+            log.error(f"  Card {idx}: {cid} — {reason}")
 
     return {"passed": passed, "failed": failed}
 
@@ -320,6 +322,8 @@ def buildWaveforms(cardArray):
     Builds a list of 6 waveAtributes objects, 3 per card.
 
     """
+    
+    log.info(f"Building waveforms for {len(cardArray)} cards.")
     waveforms = []
     for card in cardArray:
         for channel in range(1, 4): #Using 3 channels per card
