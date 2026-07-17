@@ -7,15 +7,17 @@
 # event-driven GUI updates via stateBus, and watchdog health monitoring.
 # All controls connect to real hardware (PXI, relay board, RS-422 serial).
 
+import csv
 import logging
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import scrolledtext
+from tkinter import scrolledtext, ttk
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
@@ -74,8 +76,10 @@ WAVEFORM_NAMES = {
 # PORT / TIMING CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-PXI_IP             = "pxi"
-RELAY_PORT         = "COM7"
+GROUND_CONFIGS_DIR = os.path.join(_HERE, "groundConfigs")
+
+PXI_IP             = "169.254.112.5"
+RELAY_PORT         = "COM5"
 SERIAL_PORT        = "COM3"
 SERIAL_BAUD        = 9600
 
@@ -538,6 +542,71 @@ def _reconnect_relay(new_port: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# GROUND CONFIGS  (save/load current card state as CSV, same shape as flight
+# waveConfigs but without activeTime/settlingTime)
+# ══════════════════════════════════════════════════════════════════════════════
+
+GROUND_CONFIG_FIELDS = ["channel", "frequency", "amplitude", "offset", "phase", "waveform_type"]
+
+
+def _ensureGroundConfigsDir():
+    os.makedirs(GROUND_CONFIGS_DIR, exist_ok=True)
+
+
+def listGroundConfigs():
+    """Return sorted config names (without .csv) found in groundConfigs/."""
+    _ensureGroundConfigsDir()
+    return sorted(
+        os.path.splitext(f)[0]
+        for f in os.listdir(GROUND_CONFIGS_DIR)
+        if f.lower().endswith(".csv")
+    )
+
+
+def saveGroundConfig(name):
+    """Write the currently-applied hardware state (pxiWaves) to groundConfigs/<name>.csv."""
+    _ensureGroundConfigsDir()
+    path = os.path.join(GROUND_CONFIGS_DIR, f"{name}.csv")
+    rows = []
+    with pxiLock:
+        for pair_idx in range(NUM_PAIRS):
+            card_idx, ch_num = CHANNEL_MAP[pair_idx]
+            wave_idx = card_idx * 3 + (ch_num - 1)
+            if wave_idx >= len(pxiWaves):
+                continue
+            wave = pxiWaves[wave_idx]
+            try:
+                wf_name = WAVEFORM_NAMES.get(int(wave.getWaveformType()), "SINE")
+            except Exception:
+                wf_name = "SINE"
+            rows.append([
+                ch_num, wave.getFrequency(), wave.getAmplitude(),
+                wave.getOffset(), wave.getPhase(), wf_name,
+            ])
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(GROUND_CONFIG_FIELDS)
+        writer.writerows(rows)
+    return path
+
+
+def loadGroundConfig(name):
+    """Read groundConfigs/<name>.csv, one row per pair in CHANNEL_MAP order."""
+    path = os.path.join(GROUND_CONFIGS_DIR, f"{name}.csv")
+    rows = []
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append({
+                "frequency": float(row["frequency"]),
+                "amplitude": float(row["amplitude"]),
+                "offset":    float(row["offset"]),
+                "phase":     float(row["phase"]),
+            })
+    return rows
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # WATCHDOG
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -627,10 +696,18 @@ def initHardware():
     try:
         waves = initPXIE(PXI_IP)
         pxiWaves.extend(waves)
-        logMsg("INFO",
-            f"PXI: {len(waves) // 3} card(s) initialized, {len(waves)} channels ready")
+        if waves:
+            logMsg("INFO",
+                f"PXI: {len(waves) // 3} card(s) initialized, {len(waves)} channels ready")
+        else:
+            logMsg("ERROR", f"PXI: connected to {PXI_IP} but found 0 free cards "
+                             f"(already claimed by another session?)")
+            _lxi_append_error(f"connected to {PXI_IP} but found 0 free cards "
+                               f"(already claimed by another session?)")
+            errors.append("PXI: 0 cards found")
     except Exception as e:
         logMsg("ERROR", f"PXI init failed: {e}")
+        _lxi_append_error(f"startup init failed (IP {PXI_IP}): {e}")
         errors.append(f"PXI: {e}")
 
     try:
@@ -867,6 +944,16 @@ class PairControls(tk.Frame):
         """Public entry point used by 'Apply All Pairs'."""
         self._apply()
 
+    def load_values(self, freq, amp, offset, phase):
+        """Populate sliders/entries from a saved config and immediately apply."""
+        for key, val in (("freq", freq), ("amp", amp), ("offset", offset), ("phase", phase)):
+            entry, fmt, lo, hi = self._entries[key]
+            clamped = max(lo, min(hi, val))
+            self._vars[key].set(clamped)
+            entry.delete(0, "end")
+            entry.insert(0, format(clamped, fmt))
+        self._apply()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LXI CABINET MANAGER WINDOW
@@ -1026,7 +1113,8 @@ class LXIManagerWindow(tk.Toplevel):
             self._status_lbl.config(text="OFFLINE", fg=RED)
         self._info_lbl.config(
             text=f"Cards: {n_cards}  |  Reinit count: {pxiReinitCount}  |  IP: {PXI_IP}")
-        self._ip_var.set(PXI_IP)
+        if self.focus_get() is not self._ip_entry:
+            self._ip_var.set(PXI_IP)
 
         # Card table — rebuild in background to avoid blocking on CardId()
         threading.Thread(target=self._fetch_card_info, daemon=True).start()
@@ -1303,7 +1391,8 @@ class RelayManagerWindow(tk.Toplevel):
             self._status_lbl.config(text="DISCONNECTED", fg=RED)
             self._info_lbl.config(
                 text=f"Port: {rc.port}  |  Baud: {rc.baud}")
-        self._port_var.set(RELAY_PORT)
+        if self.focus_get() is not self._port_entry:
+            self._port_var.set(RELAY_PORT)
 
         # Relay state table
         for i in range(NUM_RELAYS):
@@ -1416,6 +1505,34 @@ class GroundControllerApp(tk.Tk):
             ctrl.pack(fill="x", pady=1)
             tk.Frame(scroll.inner, bg=BG_HL, height=1).pack(fill="x")
             self._pair_controls.append(ctrl)
+
+        # Ground config save/load bar
+        cfg_frame = tk.LabelFrame(self, text="Ground Configs",
+                                  bg=BG, fg=FG, font=("Helvetica", 9, "bold"),
+                                  padx=8, pady=4)
+        cfg_frame.pack(fill="x", padx=10, pady=4)
+
+        tk.Label(cfg_frame, text="Load:", bg=BG, fg=FG_DIM,
+                 font=("Helvetica", 9)).pack(side="left")
+        self._config_var = tk.StringVar()
+        self._config_dropdown = ttk.Combobox(
+            cfg_frame, textvariable=self._config_var, state="readonly", width=24)
+        self._config_dropdown.pack(side="left", padx=(4, 8))
+        tk.Button(cfg_frame, text="Load", bg=BG_HL, fg=BLUE, relief="flat",
+                  padx=10, activebackground=BLUE, activeforeground=BG,
+                  command=self._load_config).pack(side="left", padx=(0, 16))
+
+        tk.Label(cfg_frame, text="Save as:", bg=BG, fg=FG_DIM,
+                 font=("Helvetica", 9)).pack(side="left")
+        self._save_name_var = tk.StringVar()
+        tk.Entry(cfg_frame, textvariable=self._save_name_var, width=20,
+                 bg=BG_HL, fg=FG, insertbackground=FG,
+                 relief="flat", bd=2).pack(side="left", padx=(4, 8))
+        tk.Button(cfg_frame, text="Save", bg=BG_HL, fg=GREEN, relief="flat",
+                  padx=10, activebackground=GREEN, activeforeground=BG,
+                  command=self._save_config).pack(side="left")
+
+        self._refresh_config_dropdown()
 
         # Action bar
         action = tk.Frame(self, bg=BG)
@@ -1618,6 +1735,40 @@ class GroundControllerApp(tk.Tk):
 
     def _stop_all(self):
         pxiQueue.put(("stop_all",))
+
+    def _refresh_config_dropdown(self):
+        self._config_dropdown["values"] = listGroundConfigs()
+
+    def _save_config(self):
+        name = self._save_name_var.get().strip()
+        if not name:
+            logMsg("WARNING", "Save config: no name entered")
+            return
+        safe_name = re.sub(r"[^A-Za-z0-9_\- ]", "_", name)
+        try:
+            path = saveGroundConfig(safe_name)
+            logMsg("INFO", f"Ground config saved: {path}")
+            self._refresh_config_dropdown()
+            self._config_var.set(safe_name)
+        except Exception as e:
+            logMsg("ERROR", f"Failed to save ground config '{safe_name}': {e}")
+
+    def _load_config(self):
+        name = self._config_var.get().strip()
+        if not name:
+            logMsg("WARNING", "Load config: no config selected")
+            return
+        try:
+            rows = loadGroundConfig(name)
+        except Exception as e:
+            logMsg("ERROR", f"Failed to load ground config '{name}': {e}")
+            return
+        for pair_idx, row in enumerate(rows):
+            if pair_idx >= len(self._pair_controls):
+                break
+            self._pair_controls[pair_idx].load_values(
+                row["frequency"], row["amplitude"], row["offset"], row["phase"])
+        logMsg("INFO", f"Ground config '{name}' loaded and applied ({len(rows)} pair(s))")
 
     def _open_lxi_manager(self):
         global _lxiManagerWindow
