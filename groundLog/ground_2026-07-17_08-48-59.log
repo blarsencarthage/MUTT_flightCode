@@ -1,0 +1,60 @@
+2026-07-17 08:49:01,117 [MainThread] INFO: RelayController starting on COM5 @ 19200 baud.
+2026-07-17 08:49:01,117 [TELEM] ERROR: PXI init failed: Client: Connection refused.
+2026-07-17 08:49:01,117 [MainThread] INFO: Connecting to COM5...
+2026-07-17 08:49:01,118 [MainThread] ERROR: Connection failed: could not open port 'COM5': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)
+2026-07-17 08:49:01,119 [RelayEventLoop] INFO: Event loop started (poll=50 ms, relays 0-3).
+2026-07-17 08:49:01,119 [TELEM] INFO: Relay controller started on COM5
+2026-07-17 08:49:01,159 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:01,160 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-17 08:49:01,160 [TELEM] WARNING: PXI reinit attempt 1/3
+2026-07-17 08:49:01,161 [TELEM] ERROR: PXI reinit failed: Client: Connection refused.
+2026-07-17 08:49:03,129 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:05,130 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:06,144 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-17 08:49:06,144 [TELEM] WARNING: PXI reinit attempt 2/3
+2026-07-17 08:49:06,160 [TELEM] ERROR: PXI reinit failed: Client: Connection refused.
+2026-07-17 08:49:07,137 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:09,146 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:11,155 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:11,164 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-17 08:49:11,164 [TELEM] WARNING: PXI reinit attempt 3/3
+2026-07-17 08:49:11,165 [TELEM] ERROR: PXI reinit failed: Client: Connection refused.
+2026-07-17 08:49:13,155 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:15,169 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:16,169 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-17 08:49:16,169 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — entering safe mode
+2026-07-17 08:49:16,170 [TELEM] CRITICAL: ENTERING SAFE MODE
+2026-07-17 08:49:16,170 [TELEM] INFO: Safe mode: all relays opened
+2026-07-17 08:49:16,170 [TELEM] INFO: Safe mode: PXI outputs zeroed
+2026-07-17 08:49:17,183 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:19,198 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:21,171 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-17 08:49:21,172 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — entering safe mode
+2026-07-17 08:49:21,200 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:23,213 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:25,216 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:26,174 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-17 08:49:26,174 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — entering safe mode
+2026-07-17 08:49:27,217 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:29,221 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:31,176 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-17 08:49:31,177 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — entering safe mode
+2026-07-17 08:49:31,225 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:33,240 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:35,251 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:36,179 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-17 08:49:36,179 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — entering safe mode
+2026-07-17 08:49:37,255 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:39,260 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:41,183 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-17 08:49:41,183 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — entering safe mode
+2026-07-17 08:49:41,274 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:43,275 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:45,292 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:46,187 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-17 08:49:46,187 [TELEM] CRITICAL: PXI reinit exceeded 3 attempts — entering safe mode
+2026-07-17 08:49:47,296 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:49,301 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 08:49:49,727 [MainThread] INFO: RelayController stopping.
+2026-07-17 08:49:49,746 [RelayEventLoop] INFO: Event loop stopped.
+2026-07-17 08:49:49,746 [MainThread] INFO: RelayController stopped.

@@ -1,0 +1,15 @@
+2026-07-17 13:37:33,937 [MainThread] INFO: RelayController starting on COM5 @ 19200 baud.
+2026-07-17 13:37:33,937 [TELEM] ERROR: PXI init failed: Client: Connect failed.
+2026-07-17 13:37:33,938 [MainThread] INFO: Connecting to COM5...
+2026-07-17 13:37:33,938 [MainThread] ERROR: Connection failed: could not open port 'COM5': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)
+2026-07-17 13:37:33,939 [RelayEventLoop] INFO: Event loop started (poll=50 ms, relays 0-3).
+2026-07-17 13:37:33,939 [TELEM] INFO: Relay controller started on COM5
+2026-07-17 13:37:33,979 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 13:37:33,980 [TELEM] ERROR: PXI health check failed — reinitialising connection
+2026-07-17 13:37:33,980 [TELEM] WARNING: PXI reinit attempt 1 (next retry in 5s if this fails)
+2026-07-17 13:37:35,956 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 13:37:37,959 [TELEM] WARNING: SERIAL: port error (could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)) — reconnecting in 2s
+2026-07-17 13:37:38,952 [TELEM] ERROR: PXI reinit failed: Client: Connect failed.
+2026-07-17 13:37:39,522 [MainThread] INFO: RelayController stopping.
+2026-07-17 13:37:39,538 [RelayEventLoop] INFO: Event loop stopped.
+2026-07-17 13:37:39,538 [MainThread] INFO: RelayController stopped.
