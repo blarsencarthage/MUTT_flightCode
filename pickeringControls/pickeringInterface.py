@@ -212,6 +212,37 @@ def updateWaveform(card, wave: waveAtributes):
     except pilxi.Error as error:
         log.error("Exception occurred: %s", error.message)
 
+
+def readChannelStatus(card, channel):
+    """Read the generator's live setpoints and run state back from hardware.
+
+    Unlike the waveAtributes cache (which reflects the last commanded values
+    regardless of whether the write actually reached the card), this issues
+    PIFGLX_Get* calls directly against the card — useful for confirming
+    whether a set/InitiateGeneration call actually took effect.
+
+    Returns a dict with frequency, amplitude, offset, phase, waveform_type
+    (raw int), waveform_name (str), and generating (bool). Raises pilxi.Error
+    on failure — callers should catch and surface it rather than swallow it,
+    since the failure itself is diagnostic information.
+    """
+    wf_type = card.PIFGLX_GetWaveform(channel)
+    wf_name = None
+    for name, value in _WAVEFORM_TYPE_MAP.items():
+        if value == wf_type:
+            wf_name = name
+            break
+    return {
+        "frequency": card.PIFGLX_GetFrequency(channel),
+        "amplitude": card.PIFGLX_GetAmplitude(channel),
+        "offset": card.PIFGLX_GetDcOffset(channel),
+        "phase": card.PIFGLX_GetStartPhase(channel),
+        "waveform_type": wf_type,
+        "waveform_name": wf_name or str(wf_type),
+        "generating": bool(card.PIFGLX_GetGenerationState(channel, 1)),
+    }
+
+
 def waveformSelfCheck(cards):
     """
     Self-check routine for an array of 41-620 waveform generator card objects.

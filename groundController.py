@@ -23,7 +23,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(_HERE, "spacecraftSerial"))
 
-from pickeringControls.pickeringInterface import initPXIE, updateWaveform, waveAtributes
+from pickeringControls.pickeringInterface import initPXIE, updateWaveform, waveAtributes, readChannelStatus
 from relayControls.relaySerial import RelayController
 import serial
 
@@ -1023,6 +1023,7 @@ class LXIManagerWindow(tk.Toplevel):
 
         self._error_shown_count = 0   # how many lxiErrors entries are in the log box
         self._card_rows: list[list[tk.Label]] = []
+        self._channel_rows: list[list[tk.Label]] = []
 
         self._build_ui()
         self._refresh()
@@ -1085,6 +1086,32 @@ class LXIManagerWindow(tk.Toplevel):
                                       bg=BG, fg=FG_DIM, font=("Italic", 8))
         self._no_cards_lbl.grid(row=1, column=0, columnspan=len(headers),
                                  sticky="w", padx=4, pady=2)
+
+        # ── Section B2: Live Generator Status (read directly from hardware) ───
+        chan_frame = tk.LabelFrame(self, text="Generator Status (live hardware read-back)",
+                                   bg=BG, fg=FG, font=("Helvetica", 9, "bold"),
+                                   padx=8, pady=6)
+        chan_frame.pack(fill="x", padx=10, pady=4)
+
+        chan_headers = ["Card", "Ch", "Cmd Freq", "Live Freq", "Live Amp", "Waveform", "State"]
+        chan_widths  = [5,      3,    9,           9,           8,          9,          6]
+        for col, (h, w) in enumerate(zip(chan_headers, chan_widths)):
+            tk.Label(chan_frame, text=h, bg=BG, fg=FG_DIM,
+                     font=("Helvetica", 8, "bold"), width=w,
+                     anchor="w").grid(row=0, column=col, padx=3, pady=(0, 2))
+
+        self._channel_grid_frame = chan_frame
+        self._channel_grid_widths = chan_widths
+        self._no_channels_lbl = tk.Label(chan_frame, text="No channels detected.",
+                                         bg=BG, fg=FG_DIM, font=("Italic", 8))
+        self._no_channels_lbl.grid(row=1, column=0, columnspan=len(chan_headers),
+                                    sticky="w", padx=4, pady=2)
+        tk.Label(chan_frame,
+                 text="\"Cmd\" is the last value the software wrote; \"Live\" is read back "
+                      "directly from the card. A mismatch means the write didn't reach the card.",
+                 bg=BG, fg=FG_DIM, font=("Helvetica", 7, "italic"),
+                 wraplength=520, justify="left").grid(
+            row=2, column=0, columnspan=len(chan_headers), sticky="w", padx=4, pady=(4, 0))
 
         # ── Section C: Error Log ──────────────────────────────────────────────
         err_frame = tk.LabelFrame(self, text="Error Log",
@@ -1184,10 +1211,18 @@ class LXIManagerWindow(tk.Toplevel):
         self.after(2000, self._refresh)
 
     def _fetch_card_info(self):
-        """Gather CardId / CardLoc from hardware (runs in background thread)."""
+        """Gather CardId/CardLoc and live per-channel generator status from
+        hardware (runs in background thread). The channel reads use
+        readChannelStatus(), which issues PIFGLX_Get* calls straight to the
+        card — this is what lets the Generator Status table show whether a
+        commanded value actually reached the hardware, as opposed to the main
+        window's per-pair display, which only echoes the last commanded value.
+        """
         rows = []
+        channel_rows = []
         with pxiLock:
             seen_ids = {}
+            card_ch_state = {}   # card idx -> {channel: "RUN"/"IDLE"/"ERR"}
             for wave in pxiWaves:
                 card = wave._card
                 cid = id(card)
@@ -1212,7 +1247,41 @@ class LXIManagerWindow(tk.Toplevel):
                         "slot":  str(slot),
                         "ts":    time.strftime("%H:%M:%S"),
                     })
+                    card_ch_state[seen_ids[cid]] = {}
+
+                card_idx = seen_ids[cid]
+                channel = wave.getChannel()
+                try:
+                    live = readChannelStatus(card, channel)
+                    card_ch_state[card_idx][channel] = "RUN" if live["generating"] else "IDLE"
+                    channel_rows.append({
+                        "card": card_idx, "ch": channel,
+                        "cmd_freq": wave.getFrequency(),
+                        "live_freq": live["frequency"],
+                        "live_amp": live["amplitude"],
+                        "waveform": live["waveform_name"],
+                        "generating": live["generating"],
+                        "ok": True,
+                    })
+                except Exception as e:
+                    card_ch_state[card_idx][channel] = "ERR"
+                    channel_rows.append({
+                        "card": card_idx, "ch": channel,
+                        "cmd_freq": wave.getFrequency(),
+                        "live_freq": None, "live_amp": None,
+                        "waveform": f"Error: {e}",
+                        "generating": False,
+                        "ok": False,
+                    })
+                    _lxi_append_error(f"card {card_idx} ch{channel} status read failed: {e!r}")
+                    logMsg("ERROR", f"LXI card {card_idx} ch{channel} status read failed: {e!r}")
+
+            for row in rows:
+                states = card_ch_state.get(row["idx"], {})
+                row["ch_states"] = [states.get(ch, "?") for ch in (1, 2, 3)]
+
         self.after(0, self._update_card_table, rows)
+        self.after(0, self._update_channel_table, channel_rows)
 
     def _update_card_table(self, rows: list):
         if not self.winfo_exists():
@@ -1230,23 +1299,69 @@ class LXIManagerWindow(tk.Toplevel):
 
         self._no_cards_lbl.grid_remove()
         widths = self._card_grid_widths
+        ch_state_color = {"RUN": GREEN, "IDLE": FG_DIM, "ERR": RED, "?": FG_DIM}
         for r, info in enumerate(rows):
             cols_data = [
                 str(info["idx"]),
                 info["model"],
                 info["bus"],
                 info["slot"],
-                "1", "2", "3",
+                *info["ch_states"],
                 info["ts"],
             ]
+            col_colors = [FG, FG, FG, FG,
+                          *(ch_state_color.get(s, FG_DIM) for s in info["ch_states"]),
+                          FG]
             row_labels = []
-            for c, (val, w) in enumerate(zip(cols_data, widths)):
+            for c, (val, w, fg) in enumerate(zip(cols_data, widths, col_colors)):
                 lbl = tk.Label(self._card_grid_frame, text=val,
-                               bg=BG, fg=FG, font=("Courier", 8),
+                               bg=BG, fg=fg, font=("Courier", 8),
                                width=w, anchor="w")
                 lbl.grid(row=r + 1, column=c, padx=3, pady=1)
                 row_labels.append(lbl)
             self._card_rows.append(row_labels)
+
+    def _update_channel_table(self, rows: list):
+        if not self.winfo_exists():
+            return
+
+        for row_labels in self._channel_rows:
+            for lbl in row_labels:
+                lbl.destroy()
+        self._channel_rows.clear()
+
+        if not rows:
+            self._no_channels_lbl.grid()
+            return
+
+        self._no_channels_lbl.grid_remove()
+        widths = self._channel_grid_widths
+        FREQ_TOLERANCE_HZ = 1.0
+        for r, info in enumerate(rows):
+            if not info["ok"]:
+                cols_data = [str(info["card"]), str(info["ch"]),
+                             f"{info['cmd_freq']:.0f}", "?", "?",
+                             info["waveform"], "ERR"]
+                col_colors = [FG, FG, FG, RED, RED, RED, RED]
+            else:
+                mismatch = abs(info["cmd_freq"] - info["live_freq"]) > FREQ_TOLERANCE_HZ
+                freq_color = RED if mismatch else FG
+                cols_data = [
+                    str(info["card"]), str(info["ch"]),
+                    f"{info['cmd_freq']:.0f}", f"{info['live_freq']:.0f}",
+                    f"{info['live_amp']:.3f}", info["waveform"],
+                    "RUN" if info["generating"] else "IDLE",
+                ]
+                col_colors = [FG, FG, freq_color, freq_color, FG, FG,
+                              GREEN if info["generating"] else FG_DIM]
+            row_labels = []
+            for c, (val, w, fg) in enumerate(zip(cols_data, widths, col_colors)):
+                lbl = tk.Label(self._channel_grid_frame, text=val,
+                               bg=BG, fg=fg, font=("Courier", 8),
+                               width=w, anchor="w")
+                lbl.grid(row=r + 1, column=c, padx=3, pady=1)
+                row_labels.append(lbl)
+            self._channel_rows.append(row_labels)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
