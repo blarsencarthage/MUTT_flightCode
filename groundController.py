@@ -7,21 +7,23 @@
 # event-driven GUI updates via stateBus, and watchdog health monitoring.
 # All controls connect to real hardware (PXI, relay board, RS-422 serial).
 
+import csv
 import logging
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import scrolledtext
+from tkinter import scrolledtext, ttk
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(_HERE, "spacecraftSerial"))
 
-from pickeringControls.pickeringInterface import initPXIE, updateWaveform, waveAtributes
+from pickeringControls.pickeringInterface import initPXIE, updateWaveform, waveAtributes, readChannelStatus
 from relayControls.relaySerial import RelayController
 import serial
 
@@ -74,8 +76,10 @@ WAVEFORM_NAMES = {
 # PORT / TIMING CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-PXI_IP             = "pxi"
-RELAY_PORT         = "COM7"
+GROUND_CONFIGS_DIR = os.path.join(_HERE, "groundConfigs")
+
+PXI_IP             = "169.254.112.5"
+RELAY_PORT         = "COM5"
 SERIAL_PORT        = "COM3"
 SERIAL_BAUD        = 9600
 
@@ -84,6 +88,8 @@ WATCHDOG_INTERVAL  = 1.0    # s — watchdog poll rate
 HEARTBEAT_TIMEOUT  = 5.0    # s — staleness threshold
 PXI_HEALTH_INTERVAL = 5.0   # s — PXI ping cadence
 MAX_RESTARTS       = 3      # max auto-restarts before safe mode
+PXI_CONNECT_TIMEOUT_MS = 5000            # ms — Pi_Session TCP connect timeout (chassis can be slow to boot)
+PXI_RECONNECT_BACKOFF  = [5.0, 10.0, 30.0, 60.0]  # s — escalating delay between reinit attempts; holds at last value
 QUEUE_DEPTH_WARN   = 10
 QUEUE_DEPTH_ALARM  = 50
 
@@ -180,6 +186,7 @@ def _emitLog(level, message):
 # ══════════════════════════════════════════════════════════════════════════════
 
 pxiWaves:       list          = []               # waveAtributes × 6 (3 per card)
+pxiSession                    = None              # Pi_Session — must be kept alive; __del__ tears down the LXI session
 relayStates:    list          = [False] * NUM_RELAYS
 signalStates:   dict          = {name: False for name in SIGNAL_NAMES}
 threads:        dict          = {}               # name → Thread
@@ -193,6 +200,7 @@ relayQueue:     queue.Queue   = queue.Queue()
 logQueue:       queue.Queue   = queue.Queue()
 restartCounts:  dict          = {}
 pxiReinitCount: int           = 0
+pxiNextReinitTime: float      = 0.0  # monotonic time — reinitPXI() skipped until this passes
 relayController: RelayController = None
 lxiErrors:      list          = []   # timestamped error strings (newest last, max 200)
 _lxiManagerWindow = None             # singleton Toplevel reference
@@ -278,7 +286,7 @@ def pxi_worker():
                         f"not available ({len(pxiWaves)} waveform(s) initialized)")
 
         elif cmd == "reinit":
-            reinitPXI()
+            reinitPXI(force=True)  # operator-requested — bypass the auto-retry backoff
 
         elif cmd == "stop_all":
             with pxiLock:
@@ -483,16 +491,24 @@ def checkPXIHealth():
     return True
 
 
-def reinitPXI():
-    """Close all card handles and re-run initPXIE() under pxiLock."""
-    global pxiWaves, pxiReinitCount
-    pxiReinitCount += 1
-    if pxiReinitCount > MAX_RESTARTS:
-        logMsg("CRITICAL",
-               f"PXI reinit exceeded {MAX_RESTARTS} attempts — entering safe mode")
-        triggerSafeMode()
+def reinitPXI(force=False):
+    """Close all card handles and re-run initPXIE() under pxiLock.
+
+    A slow-booting LXI chassis can take well over a minute to come up, so a
+    failed attempt here backs off and tries again rather than permanently
+    giving up (unlike thread-crash restarts, which are capped by
+    MAX_RESTARTS/triggerSafeMode). pxiReinitCount only drives the backoff
+    delay; it never trips safe mode on its own. force=True (operator-requested
+    reinit) bypasses the backoff and retries immediately.
+    """
+    global pxiWaves, pxiSession, pxiReinitCount, pxiNextReinitTime
+    now = time.monotonic()
+    if not force and now < pxiNextReinitTime:
         return
-    logMsg("WARNING", f"PXI reinit attempt {pxiReinitCount}/{MAX_RESTARTS}")
+    pxiReinitCount += 1
+    delay = PXI_RECONNECT_BACKOFF[min(pxiReinitCount - 1, len(PXI_RECONNECT_BACKOFF) - 1)]
+    pxiNextReinitTime = now + delay
+    logMsg("WARNING", f"PXI reinit attempt {pxiReinitCount} (next retry in {delay:.0f}s if this fails)")
     with pxiLock:
         seen = set()
         for wave in pxiWaves:
@@ -504,13 +520,21 @@ def reinitPXI():
                 except Exception:
                     pass
         pxiWaves.clear()
+        if pxiSession is not None:
+            try:
+                pxiSession.Close()
+            except Exception:
+                pass
+            pxiSession = None
         try:
-            new_waves = initPXIE(PXI_IP)
+            new_session, new_waves = initPXIE(PXI_IP, timeout=PXI_CONNECT_TIMEOUT_MS)
             if new_waves:
+                pxiSession = new_session
                 pxiWaves.extend(new_waves)
                 logMsg("INFO",
                     f"PXI reinit OK: {len(new_waves) // 3} card(s) restored")
                 pxiReinitCount = 0
+                pxiNextReinitTime = 0.0
             else:
                 logMsg("ERROR", "PXI reinit returned no waves")
                 _lxi_append_error("reinit returned no waves")
@@ -535,6 +559,82 @@ def _reconnect_relay(new_port: str) -> None:
     except Exception as e:
         logMsg("ERROR", f"Relay reconnect failed: {e}")
         _relay_append_error(f"reconnect failed: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GROUND CONFIGS  (save/load current card state as CSV, same shape as flight
+# waveConfigs but without activeTime/settlingTime)
+# ══════════════════════════════════════════════════════════════════════════════
+
+GROUND_CONFIG_FIELDS = ["channel", "frequency", "amplitude", "offset", "phase", "waveform_type"]
+
+
+def _ensureGroundConfigsDir():
+    os.makedirs(GROUND_CONFIGS_DIR, exist_ok=True)
+
+
+def listGroundConfigs():
+    """Return sorted config names (without .csv) found in groundConfigs/."""
+    _ensureGroundConfigsDir()
+    return sorted(
+        os.path.splitext(f)[0]
+        for f in os.listdir(GROUND_CONFIGS_DIR)
+        if f.lower().endswith(".csv")
+    )
+
+
+def saveGroundConfig(name, gui_values=None):
+    """Write the currently-applied hardware state (pxiWaves) to groundConfigs/<name>.csv.
+
+    gui_values, if given, is a list of (freq, amp, offset, phase) indexed by
+    pair_idx — used as a fallback for any pair whose hardware waveform isn't
+    available (e.g. PXI not connected), so saving still captures what the
+    operator has set on the sliders instead of silently dropping the pair.
+    """
+    _ensureGroundConfigsDir()
+    path = os.path.join(GROUND_CONFIGS_DIR, f"{name}.csv")
+    rows = []
+    with pxiLock:
+        for pair_idx in range(NUM_PAIRS):
+            card_idx, ch_num = CHANNEL_MAP[pair_idx]
+            wave_idx = card_idx * 3 + (ch_num - 1)
+            if wave_idx < len(pxiWaves):
+                wave = pxiWaves[wave_idx]
+                try:
+                    wf_name = WAVEFORM_NAMES.get(int(wave.getWaveformType()), "SINE")
+                except Exception:
+                    wf_name = "SINE"
+                rows.append([
+                    ch_num, wave.getFrequency(), wave.getAmplitude(),
+                    wave.getOffset(), wave.getPhase(), wf_name,
+                ])
+            elif gui_values is not None and pair_idx < len(gui_values):
+                freq, amp, offset, phase = gui_values[pair_idx]
+                rows.append([ch_num, freq, amp, offset, phase, "SINE"])
+    if not rows:
+        logMsg("WARNING", f"Ground config '{name}' saved with no pairs "
+                           f"(no hardware and no GUI values available)")
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(GROUND_CONFIG_FIELDS)
+        writer.writerows(rows)
+    return path
+
+
+def loadGroundConfig(name):
+    """Read groundConfigs/<name>.csv, one row per pair in CHANNEL_MAP order."""
+    path = os.path.join(GROUND_CONFIGS_DIR, f"{name}.csv")
+    rows = []
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append({
+                "frequency": float(row["frequency"]),
+                "amplitude": float(row["amplitude"]),
+                "offset":    float(row["offset"]),
+                "phase":     float(row["phase"]),
+            })
+    return rows
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -619,18 +719,26 @@ def triggerSafeMode():
 
 def initHardware():
     """Initialize all hardware and start all worker threads. Returns a status string."""
-    global relayController
+    global relayController, pxiSession
     errors = []
 
     startThread("TELEM")   # start logger first so all subsequent logMsg calls work
 
     try:
-        waves = initPXIE(PXI_IP)
+        pxiSession, waves = initPXIE(PXI_IP, timeout=PXI_CONNECT_TIMEOUT_MS)
         pxiWaves.extend(waves)
-        logMsg("INFO",
-            f"PXI: {len(waves) // 3} card(s) initialized, {len(waves)} channels ready")
+        if waves:
+            logMsg("INFO",
+                f"PXI: {len(waves) // 3} card(s) initialized, {len(waves)} channels ready")
+        else:
+            logMsg("ERROR", f"PXI: connected to {PXI_IP} but found 0 free cards "
+                             f"(already claimed by another session?)")
+            _lxi_append_error(f"connected to {PXI_IP} but found 0 free cards "
+                               f"(already claimed by another session?)")
+            errors.append("PXI: 0 cards found")
     except Exception as e:
         logMsg("ERROR", f"PXI init failed: {e}")
+        _lxi_append_error(f"startup init failed (IP {PXI_IP}): {e}")
         errors.append(f"PXI: {e}")
 
     try:
@@ -790,6 +898,8 @@ class PairControls(tk.Frame):
         self._bg      = bg
         self._vars    = {}
         self._entries = {}
+        self._scales  = {}
+        self._sl_bounds = {}
         self._build()
 
     def _build(self):
@@ -820,6 +930,8 @@ class PairControls(tk.Frame):
                 command=lambda v, k=key, f=fmt: self._push_to_entry(k, float(v), f),
             )
             scale.grid(row=1, column=c, padx=(2, 0), sticky="ew")
+            self._scales[key] = scale
+            self._sl_bounds[key] = (sl_min, sl_max)
 
             entry = tk.Entry(self, width=10, justify="center",
                              bg=BG_HL, fg=FG, insertbackground=FG,
@@ -846,11 +958,25 @@ class PairControls(tk.Frame):
         entry, fmt, lo, hi = self._entries[key]
         try:
             val = max(lo, min(hi, float(entry.get())))
-            self._vars[key].set(val)
-            entry.delete(0, "end")
-            entry.insert(0, format(val, fmt))
+            self._set_value(key, val, fmt)
         except ValueError:
             pass
+
+    def _set_value(self, key, val, fmt):
+        """Set var + slider + entry together, widening the slider's range if
+        the value falls outside its normal display bounds. Without this, a
+        tk.Scale silently clamps its linked variable back within from_/to,
+        which would corrupt the value actually sent to hardware."""
+        scale = self._scales[key]
+        sl_min, sl_max = self._sl_bounds[key]
+        if val < sl_min or val > sl_max:
+            scale.configure(from_=min(sl_min, val), to=max(sl_max, val))
+        else:
+            scale.configure(from_=sl_min, to=sl_max)
+        self._vars[key].set(val)
+        entry, _, _, _ = self._entries[key]
+        entry.delete(0, "end")
+        entry.insert(0, format(val, fmt))
 
     def _apply(self):
         if self._on_focus:
@@ -865,6 +991,19 @@ class PairControls(tk.Frame):
 
     def apply(self):
         """Public entry point used by 'Apply All Pairs'."""
+        self._apply()
+
+    def get_values(self):
+        """Current freq/amp/offset/phase as shown in the sliders/entries."""
+        return (self._vars["freq"].get(), self._vars["amp"].get(),
+                self._vars["offset"].get(), self._vars["phase"].get())
+
+    def load_values(self, freq, amp, offset, phase):
+        """Populate sliders/entries from a saved config and immediately apply."""
+        for key, val in (("freq", freq), ("amp", amp), ("offset", offset), ("phase", phase)):
+            _, fmt, lo, hi = self._entries[key]
+            clamped = max(lo, min(hi, val))
+            self._set_value(key, clamped, fmt)
         self._apply()
 
 
@@ -884,6 +1023,7 @@ class LXIManagerWindow(tk.Toplevel):
 
         self._error_shown_count = 0   # how many lxiErrors entries are in the log box
         self._card_rows: list[list[tk.Label]] = []
+        self._channel_rows: list[list[tk.Label]] = []
 
         self._build_ui()
         self._refresh()
@@ -946,6 +1086,32 @@ class LXIManagerWindow(tk.Toplevel):
                                       bg=BG, fg=FG_DIM, font=("Italic", 8))
         self._no_cards_lbl.grid(row=1, column=0, columnspan=len(headers),
                                  sticky="w", padx=4, pady=2)
+
+        # ── Section B2: Live Generator Status (read directly from hardware) ───
+        chan_frame = tk.LabelFrame(self, text="Generator Status (live hardware read-back)",
+                                   bg=BG, fg=FG, font=("Helvetica", 9, "bold"),
+                                   padx=8, pady=6)
+        chan_frame.pack(fill="x", padx=10, pady=4)
+
+        chan_headers = ["Card", "Ch", "Cmd Freq", "Live Freq", "Live Amp", "Waveform", "State"]
+        chan_widths  = [5,      3,    9,           9,           8,          9,          6]
+        for col, (h, w) in enumerate(zip(chan_headers, chan_widths)):
+            tk.Label(chan_frame, text=h, bg=BG, fg=FG_DIM,
+                     font=("Helvetica", 8, "bold"), width=w,
+                     anchor="w").grid(row=0, column=col, padx=3, pady=(0, 2))
+
+        self._channel_grid_frame = chan_frame
+        self._channel_grid_widths = chan_widths
+        self._no_channels_lbl = tk.Label(chan_frame, text="No channels detected.",
+                                         bg=BG, fg=FG_DIM, font=("Italic", 8))
+        self._no_channels_lbl.grid(row=1, column=0, columnspan=len(chan_headers),
+                                    sticky="w", padx=4, pady=2)
+        tk.Label(chan_frame,
+                 text="\"Cmd\" is the last value the software wrote; \"Live\" is read back "
+                      "directly from the card. A mismatch means the write didn't reach the card.",
+                 bg=BG, fg=FG_DIM, font=("Helvetica", 7, "italic"),
+                 wraplength=520, justify="left").grid(
+            row=2, column=0, columnspan=len(chan_headers), sticky="w", padx=4, pady=(4, 0))
 
         # ── Section C: Error Log ──────────────────────────────────────────────
         err_frame = tk.LabelFrame(self, text="Error Log",
@@ -1026,7 +1192,8 @@ class LXIManagerWindow(tk.Toplevel):
             self._status_lbl.config(text="OFFLINE", fg=RED)
         self._info_lbl.config(
             text=f"Cards: {n_cards}  |  Reinit count: {pxiReinitCount}  |  IP: {PXI_IP}")
-        self._ip_var.set(PXI_IP)
+        if self.focus_get() is not self._ip_entry:
+            self._ip_var.set(PXI_IP)
 
         # Card table — rebuild in background to avoid blocking on CardId()
         threading.Thread(target=self._fetch_card_info, daemon=True).start()
@@ -1044,10 +1211,18 @@ class LXIManagerWindow(tk.Toplevel):
         self.after(2000, self._refresh)
 
     def _fetch_card_info(self):
-        """Gather CardId / CardLoc from hardware (runs in background thread)."""
+        """Gather CardId/CardLoc and live per-channel generator status from
+        hardware (runs in background thread). The channel reads use
+        readChannelStatus(), which issues PIFGLX_Get* calls straight to the
+        card — this is what lets the Generator Status table show whether a
+        commanded value actually reached the hardware, as opposed to the main
+        window's per-pair display, which only echoes the last commanded value.
+        """
         rows = []
+        channel_rows = []
         with pxiLock:
             seen_ids = {}
+            card_ch_state = {}   # card idx -> {channel: "RUN"/"IDLE"/"ERR"}
             for wave in pxiWaves:
                 card = wave._card
                 cid = id(card)
@@ -1055,10 +1230,16 @@ class LXIManagerWindow(tk.Toplevel):
                     seen_ids[cid] = len(seen_ids)
                     try:
                         model = card.CardId()
-                        bus, slot = card.CardLoc()
                     except Exception as e:
                         model = f"Error: {e}"
+                        _lxi_append_error(f"card {seen_ids[cid]} CardId() failed: {e!r}")
+                        logMsg("ERROR", f"LXI card {seen_ids[cid]} CardId() failed: {e!r}")
+                    try:
+                        bus, slot = card.CardLoc()
+                    except Exception as e:
                         bus, slot = "?", "?"
+                        _lxi_append_error(f"card {seen_ids[cid]} CardLoc() failed: {e!r}")
+                        logMsg("ERROR", f"LXI card {seen_ids[cid]} CardLoc() failed: {e!r}")
                     rows.append({
                         "idx":   seen_ids[cid],
                         "model": model,
@@ -1066,7 +1247,41 @@ class LXIManagerWindow(tk.Toplevel):
                         "slot":  str(slot),
                         "ts":    time.strftime("%H:%M:%S"),
                     })
+                    card_ch_state[seen_ids[cid]] = {}
+
+                card_idx = seen_ids[cid]
+                channel = wave.getChannel()
+                try:
+                    live = readChannelStatus(card, channel)
+                    card_ch_state[card_idx][channel] = "RUN" if live["generating"] else "IDLE"
+                    channel_rows.append({
+                        "card": card_idx, "ch": channel,
+                        "cmd_freq": wave.getFrequency(),
+                        "live_freq": live["frequency"],
+                        "live_amp": live["amplitude"],
+                        "waveform": live["waveform_name"],
+                        "generating": live["generating"],
+                        "ok": True,
+                    })
+                except Exception as e:
+                    card_ch_state[card_idx][channel] = "ERR"
+                    channel_rows.append({
+                        "card": card_idx, "ch": channel,
+                        "cmd_freq": wave.getFrequency(),
+                        "live_freq": None, "live_amp": None,
+                        "waveform": f"Error: {e}",
+                        "generating": False,
+                        "ok": False,
+                    })
+                    _lxi_append_error(f"card {card_idx} ch{channel} status read failed: {e!r}")
+                    logMsg("ERROR", f"LXI card {card_idx} ch{channel} status read failed: {e!r}")
+
+            for row in rows:
+                states = card_ch_state.get(row["idx"], {})
+                row["ch_states"] = [states.get(ch, "?") for ch in (1, 2, 3)]
+
         self.after(0, self._update_card_table, rows)
+        self.after(0, self._update_channel_table, channel_rows)
 
     def _update_card_table(self, rows: list):
         if not self.winfo_exists():
@@ -1084,23 +1299,69 @@ class LXIManagerWindow(tk.Toplevel):
 
         self._no_cards_lbl.grid_remove()
         widths = self._card_grid_widths
+        ch_state_color = {"RUN": GREEN, "IDLE": FG_DIM, "ERR": RED, "?": FG_DIM}
         for r, info in enumerate(rows):
             cols_data = [
                 str(info["idx"]),
                 info["model"],
                 info["bus"],
                 info["slot"],
-                "1", "2", "3",
+                *info["ch_states"],
                 info["ts"],
             ]
+            col_colors = [FG, FG, FG, FG,
+                          *(ch_state_color.get(s, FG_DIM) for s in info["ch_states"]),
+                          FG]
             row_labels = []
-            for c, (val, w) in enumerate(zip(cols_data, widths)):
+            for c, (val, w, fg) in enumerate(zip(cols_data, widths, col_colors)):
                 lbl = tk.Label(self._card_grid_frame, text=val,
-                               bg=BG, fg=FG, font=("Courier", 8),
+                               bg=BG, fg=fg, font=("Courier", 8),
                                width=w, anchor="w")
                 lbl.grid(row=r + 1, column=c, padx=3, pady=1)
                 row_labels.append(lbl)
             self._card_rows.append(row_labels)
+
+    def _update_channel_table(self, rows: list):
+        if not self.winfo_exists():
+            return
+
+        for row_labels in self._channel_rows:
+            for lbl in row_labels:
+                lbl.destroy()
+        self._channel_rows.clear()
+
+        if not rows:
+            self._no_channels_lbl.grid()
+            return
+
+        self._no_channels_lbl.grid_remove()
+        widths = self._channel_grid_widths
+        FREQ_TOLERANCE_HZ = 1.0
+        for r, info in enumerate(rows):
+            if not info["ok"]:
+                cols_data = [str(info["card"]), str(info["ch"]),
+                             f"{info['cmd_freq']:.0f}", "?", "?",
+                             info["waveform"], "ERR"]
+                col_colors = [FG, FG, FG, RED, RED, RED, RED]
+            else:
+                mismatch = abs(info["cmd_freq"] - info["live_freq"]) > FREQ_TOLERANCE_HZ
+                freq_color = RED if mismatch else FG
+                cols_data = [
+                    str(info["card"]), str(info["ch"]),
+                    f"{info['cmd_freq']:.0f}", f"{info['live_freq']:.0f}",
+                    f"{info['live_amp']:.3f}", info["waveform"],
+                    "RUN" if info["generating"] else "IDLE",
+                ]
+                col_colors = [FG, FG, freq_color, freq_color, FG, FG,
+                              GREEN if info["generating"] else FG_DIM]
+            row_labels = []
+            for c, (val, w, fg) in enumerate(zip(cols_data, widths, col_colors)):
+                lbl = tk.Label(self._channel_grid_frame, text=val,
+                               bg=BG, fg=fg, font=("Courier", 8),
+                               width=w, anchor="w")
+                lbl.grid(row=r + 1, column=c, padx=3, pady=1)
+                row_labels.append(lbl)
+            self._channel_rows.append(row_labels)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1303,7 +1564,8 @@ class RelayManagerWindow(tk.Toplevel):
             self._status_lbl.config(text="DISCONNECTED", fg=RED)
             self._info_lbl.config(
                 text=f"Port: {rc.port}  |  Baud: {rc.baud}")
-        self._port_var.set(RELAY_PORT)
+        if self.focus_get() is not self._port_entry:
+            self._port_var.set(RELAY_PORT)
 
         # Relay state table
         for i in range(NUM_RELAYS):
@@ -1383,8 +1645,15 @@ class GroundControllerApp(tk.Tk):
                                     bg=BG, fg=YELLOW, font=("Helvetica", 9))
         self._status_lbl.pack(side="right")
 
+        # Everything below the title bar lives in a scrollable region so that
+        # nothing (e.g. the LXI/Relay Manager buttons) gets clipped off the
+        # bottom of the screen if the content is taller than the display.
+        main_scroll = ScrollFrame(self)
+        main_scroll.pack(fill="both", expand=True)
+        content = main_scroll.inner
+
         # Body: array diagram (left) | status panels (right)
-        body = tk.Frame(self, bg=BG)
+        body = tk.Frame(content, bg=BG)
         body.pack(fill="x", padx=10, pady=4)
 
         left = tk.Frame(body, bg=BG, width=300)
@@ -1402,7 +1671,7 @@ class GroundControllerApp(tk.Tk):
         self._build_thread_panel(right)
 
         # Pair controls
-        ctrl_frame = tk.LabelFrame(self, text="Pair Controls",
+        ctrl_frame = tk.LabelFrame(content, text="Pair Controls",
                                    bg=BG, fg=FG, font=("Helvetica", 9, "bold"),
                                    padx=4, pady=4)
         ctrl_frame.pack(fill="x", padx=10, pady=4)
@@ -1417,8 +1686,36 @@ class GroundControllerApp(tk.Tk):
             tk.Frame(scroll.inner, bg=BG_HL, height=1).pack(fill="x")
             self._pair_controls.append(ctrl)
 
+        # Ground config save/load bar
+        cfg_frame = tk.LabelFrame(content, text="Ground Configs",
+                                  bg=BG, fg=FG, font=("Helvetica", 9, "bold"),
+                                  padx=8, pady=4)
+        cfg_frame.pack(fill="x", padx=10, pady=4)
+
+        tk.Label(cfg_frame, text="Load:", bg=BG, fg=FG_DIM,
+                 font=("Helvetica", 9)).pack(side="left")
+        self._config_var = tk.StringVar()
+        self._config_dropdown = ttk.Combobox(
+            cfg_frame, textvariable=self._config_var, state="readonly", width=24)
+        self._config_dropdown.pack(side="left", padx=(4, 8))
+        tk.Button(cfg_frame, text="Load", bg=BG_HL, fg=BLUE, relief="flat",
+                  padx=10, activebackground=BLUE, activeforeground=BG,
+                  command=self._load_config).pack(side="left", padx=(0, 16))
+
+        tk.Label(cfg_frame, text="Save as:", bg=BG, fg=FG_DIM,
+                 font=("Helvetica", 9)).pack(side="left")
+        self._save_name_var = tk.StringVar()
+        tk.Entry(cfg_frame, textvariable=self._save_name_var, width=20,
+                 bg=BG_HL, fg=FG, insertbackground=FG,
+                 relief="flat", bd=2).pack(side="left", padx=(4, 8))
+        tk.Button(cfg_frame, text="Save", bg=BG_HL, fg=GREEN, relief="flat",
+                  padx=10, activebackground=GREEN, activeforeground=BG,
+                  command=self._save_config).pack(side="left")
+
+        self._refresh_config_dropdown()
+
         # Action bar
-        action = tk.Frame(self, bg=BG)
+        action = tk.Frame(content, bg=BG)
         action.pack(fill="x", padx=10, pady=(0, 4))
         for label, cmd in [("Apply All Pairs", self._apply_all),
                             ("Stop All",        self._stop_all)]:
@@ -1436,14 +1733,14 @@ class GroundControllerApp(tk.Tk):
                   command=self._open_relay_manager).pack(side="left", padx=(0, 10))
 
         # LXI channel table
-        lxi_frame = tk.LabelFrame(self, text="LXI Function Generators",
+        lxi_frame = tk.LabelFrame(content, text="LXI Function Generators",
                                   bg=BG, fg=FG, font=("Helvetica", 9, "bold"),
                                   padx=6, pady=4)
         lxi_frame.pack(fill="x", padx=10, pady=4)
         self._build_lxi_panel(lxi_frame)
 
         # Log pane
-        log_frame = tk.LabelFrame(self, text="Log",
+        log_frame = tk.LabelFrame(content, text="Log",
                                   bg=BG, fg=FG, font=("Helvetica", 9, "bold"),
                                   padx=4, pady=4)
         log_frame.pack(fill="both", expand=True, padx=10, pady=(4, 8))
@@ -1618,6 +1915,44 @@ class GroundControllerApp(tk.Tk):
 
     def _stop_all(self):
         pxiQueue.put(("stop_all",))
+
+    def _refresh_config_dropdown(self):
+        self._config_dropdown["values"] = listGroundConfigs()
+
+    def _save_config(self):
+        name = self._save_name_var.get().strip()
+        if not name:
+            logMsg("WARNING", "Save config: no name entered")
+            return
+        safe_name = re.sub(r"[^A-Za-z0-9_\- ]", "_", name)
+        gui_values = [ctrl.get_values() for ctrl in self._pair_controls]
+        try:
+            path = saveGroundConfig(safe_name, gui_values=gui_values)
+            logMsg("INFO", f"Ground config saved: {path}")
+            self._refresh_config_dropdown()
+            self._config_var.set(safe_name)
+        except Exception as e:
+            logMsg("ERROR", f"Failed to save ground config '{safe_name}': {e}")
+
+    def _load_config(self):
+        name = self._config_var.get().strip()
+        if not name:
+            logMsg("WARNING", "Load config: no config selected")
+            return
+        try:
+            rows = loadGroundConfig(name)
+        except Exception as e:
+            logMsg("ERROR", f"Failed to load ground config '{name}': {e}")
+            return
+        if not rows:
+            logMsg("WARNING", f"Ground config '{name}' has no saved pairs — nothing to load")
+            return
+        for pair_idx, row in enumerate(rows):
+            if pair_idx >= len(self._pair_controls):
+                break
+            self._pair_controls[pair_idx].load_values(
+                row["frequency"], row["amplitude"], row["offset"], row["phase"])
+        logMsg("INFO", f"Ground config '{name}' loaded and applied ({len(rows)} pair(s))")
 
     def _open_lxi_manager(self):
         global _lxiManagerWindow

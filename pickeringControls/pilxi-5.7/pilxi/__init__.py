@@ -870,7 +870,7 @@ class Pi_Session(Pi_Base):
         err = self._handleCMLX.PICMLX_GetForeignSessions(self.session, ctypes.byref(sessions), ctypes.byref(numSessions))
         self._handlePICMLXError(err)
 
-        return [int(session) for session in sessions]
+        return [int(session) for session in sessions[:numSessions.value]]
 
     def GetActiveSession(self):
         session = ctypes.c_uint32(0)

@@ -70,15 +70,19 @@ class TestInitPXIE(unittest.TestCase):
         _fake_pilxi.Pi_Session.return_value = self.mock_session
 
     def test_no_free_cards_returns_empty_list(self):
-        result = pi.initPXIE()
+        session, result = pi.initPXIE()
         self.assertEqual(result, [])
+
+    def test_returns_the_session_used_to_open_cards(self):
+        session, result = pi.initPXIE()
+        self.assertIs(session, self.mock_session)
 
     def test_one_card_returns_three_wave_attributes(self):
         card = _make_card()
         self.mock_session.FindFreeCards.return_value = [(1, 2)]
         self.mock_session.OpenCard.return_value = card
 
-        result = pi.initPXIE()
+        session, result = pi.initPXIE()
 
         self.assertEqual(len(result), 3)
         for wave in result:
@@ -90,7 +94,7 @@ class TestInitPXIE(unittest.TestCase):
         self.mock_session.FindFreeCards.return_value = [(1, 1), (2, 2)]
         self.mock_session.OpenCard.side_effect = [card1, card2]
 
-        result = pi.initPXIE()
+        session, result = pi.initPXIE()
 
         self.assertEqual(len(result), 6)
 
@@ -99,7 +103,7 @@ class TestInitPXIE(unittest.TestCase):
         self.mock_session.FindFreeCards.return_value = [(1, 1)]
         self.mock_session.OpenCard.return_value = card
 
-        result = pi.initPXIE()
+        session, result = pi.initPXIE()
 
         self.assertEqual([w.getChannel() for w in result], [1, 2, 3])
 
@@ -116,7 +120,7 @@ class TestInitPXIE(unittest.TestCase):
         self.mock_session.FindFreeCards.return_value = [(1, 2)]
         self.mock_session.OpenCard.side_effect = _FakePilxiError("open failed")
 
-        result = pi.initPXIE()
+        session, result = pi.initPXIE()
 
         self.assertEqual(result, [])
 
@@ -125,7 +129,7 @@ class TestInitPXIE(unittest.TestCase):
         self.mock_session.FindFreeCards.return_value = [(1, 1), (2, 2)]
         self.mock_session.OpenCard.side_effect = [_FakePilxiError("fail"), card2]
 
-        result = pi.initPXIE()
+        session, result = pi.initPXIE()
 
         self.assertEqual(len(result), 3)
         for wave in result:

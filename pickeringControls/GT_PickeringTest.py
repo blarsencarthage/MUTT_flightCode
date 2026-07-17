@@ -1,6 +1,6 @@
 import pickeringInterface as pI
 
-waves = pI.initPXIE()
+session, waves = pI.initPXIE()
 
 channel = 1
 frequency = 255000  # hz
