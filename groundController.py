@@ -88,6 +88,8 @@ WATCHDOG_INTERVAL  = 1.0    # s — watchdog poll rate
 HEARTBEAT_TIMEOUT  = 5.0    # s — staleness threshold
 PXI_HEALTH_INTERVAL = 5.0   # s — PXI ping cadence
 MAX_RESTARTS       = 3      # max auto-restarts before safe mode
+PXI_CONNECT_TIMEOUT_MS = 5000            # ms — Pi_Session TCP connect timeout (chassis can be slow to boot)
+PXI_RECONNECT_BACKOFF  = [5.0, 10.0, 30.0, 60.0]  # s — escalating delay between reinit attempts; holds at last value
 QUEUE_DEPTH_WARN   = 10
 QUEUE_DEPTH_ALARM  = 50
 
@@ -184,6 +186,7 @@ def _emitLog(level, message):
 # ══════════════════════════════════════════════════════════════════════════════
 
 pxiWaves:       list          = []               # waveAtributes × 6 (3 per card)
+pxiSession                    = None              # Pi_Session — must be kept alive; __del__ tears down the LXI session
 relayStates:    list          = [False] * NUM_RELAYS
 signalStates:   dict          = {name: False for name in SIGNAL_NAMES}
 threads:        dict          = {}               # name → Thread
@@ -197,6 +200,7 @@ relayQueue:     queue.Queue   = queue.Queue()
 logQueue:       queue.Queue   = queue.Queue()
 restartCounts:  dict          = {}
 pxiReinitCount: int           = 0
+pxiNextReinitTime: float      = 0.0  # monotonic time — reinitPXI() skipped until this passes
 relayController: RelayController = None
 lxiErrors:      list          = []   # timestamped error strings (newest last, max 200)
 _lxiManagerWindow = None             # singleton Toplevel reference
@@ -282,7 +286,7 @@ def pxi_worker():
                         f"not available ({len(pxiWaves)} waveform(s) initialized)")
 
         elif cmd == "reinit":
-            reinitPXI()
+            reinitPXI(force=True)  # operator-requested — bypass the auto-retry backoff
 
         elif cmd == "stop_all":
             with pxiLock:
@@ -487,16 +491,24 @@ def checkPXIHealth():
     return True
 
 
-def reinitPXI():
-    """Close all card handles and re-run initPXIE() under pxiLock."""
-    global pxiWaves, pxiReinitCount
-    pxiReinitCount += 1
-    if pxiReinitCount > MAX_RESTARTS:
-        logMsg("CRITICAL",
-               f"PXI reinit exceeded {MAX_RESTARTS} attempts — entering safe mode")
-        triggerSafeMode()
+def reinitPXI(force=False):
+    """Close all card handles and re-run initPXIE() under pxiLock.
+
+    A slow-booting LXI chassis can take well over a minute to come up, so a
+    failed attempt here backs off and tries again rather than permanently
+    giving up (unlike thread-crash restarts, which are capped by
+    MAX_RESTARTS/triggerSafeMode). pxiReinitCount only drives the backoff
+    delay; it never trips safe mode on its own. force=True (operator-requested
+    reinit) bypasses the backoff and retries immediately.
+    """
+    global pxiWaves, pxiSession, pxiReinitCount, pxiNextReinitTime
+    now = time.monotonic()
+    if not force and now < pxiNextReinitTime:
         return
-    logMsg("WARNING", f"PXI reinit attempt {pxiReinitCount}/{MAX_RESTARTS}")
+    pxiReinitCount += 1
+    delay = PXI_RECONNECT_BACKOFF[min(pxiReinitCount - 1, len(PXI_RECONNECT_BACKOFF) - 1)]
+    pxiNextReinitTime = now + delay
+    logMsg("WARNING", f"PXI reinit attempt {pxiReinitCount} (next retry in {delay:.0f}s if this fails)")
     with pxiLock:
         seen = set()
         for wave in pxiWaves:
@@ -508,13 +520,21 @@ def reinitPXI():
                 except Exception:
                     pass
         pxiWaves.clear()
+        if pxiSession is not None:
+            try:
+                pxiSession.Close()
+            except Exception:
+                pass
+            pxiSession = None
         try:
-            new_waves = initPXIE(PXI_IP)
+            new_session, new_waves = initPXIE(PXI_IP, timeout=PXI_CONNECT_TIMEOUT_MS)
             if new_waves:
+                pxiSession = new_session
                 pxiWaves.extend(new_waves)
                 logMsg("INFO",
                     f"PXI reinit OK: {len(new_waves) // 3} card(s) restored")
                 pxiReinitCount = 0
+                pxiNextReinitTime = 0.0
             else:
                 logMsg("ERROR", "PXI reinit returned no waves")
                 _lxi_append_error("reinit returned no waves")
@@ -563,8 +583,14 @@ def listGroundConfigs():
     )
 
 
-def saveGroundConfig(name):
-    """Write the currently-applied hardware state (pxiWaves) to groundConfigs/<name>.csv."""
+def saveGroundConfig(name, gui_values=None):
+    """Write the currently-applied hardware state (pxiWaves) to groundConfigs/<name>.csv.
+
+    gui_values, if given, is a list of (freq, amp, offset, phase) indexed by
+    pair_idx — used as a fallback for any pair whose hardware waveform isn't
+    available (e.g. PXI not connected), so saving still captures what the
+    operator has set on the sliders instead of silently dropping the pair.
+    """
     _ensureGroundConfigsDir()
     path = os.path.join(GROUND_CONFIGS_DIR, f"{name}.csv")
     rows = []
@@ -572,17 +598,22 @@ def saveGroundConfig(name):
         for pair_idx in range(NUM_PAIRS):
             card_idx, ch_num = CHANNEL_MAP[pair_idx]
             wave_idx = card_idx * 3 + (ch_num - 1)
-            if wave_idx >= len(pxiWaves):
-                continue
-            wave = pxiWaves[wave_idx]
-            try:
-                wf_name = WAVEFORM_NAMES.get(int(wave.getWaveformType()), "SINE")
-            except Exception:
-                wf_name = "SINE"
-            rows.append([
-                ch_num, wave.getFrequency(), wave.getAmplitude(),
-                wave.getOffset(), wave.getPhase(), wf_name,
-            ])
+            if wave_idx < len(pxiWaves):
+                wave = pxiWaves[wave_idx]
+                try:
+                    wf_name = WAVEFORM_NAMES.get(int(wave.getWaveformType()), "SINE")
+                except Exception:
+                    wf_name = "SINE"
+                rows.append([
+                    ch_num, wave.getFrequency(), wave.getAmplitude(),
+                    wave.getOffset(), wave.getPhase(), wf_name,
+                ])
+            elif gui_values is not None and pair_idx < len(gui_values):
+                freq, amp, offset, phase = gui_values[pair_idx]
+                rows.append([ch_num, freq, amp, offset, phase, "SINE"])
+    if not rows:
+        logMsg("WARNING", f"Ground config '{name}' saved with no pairs "
+                           f"(no hardware and no GUI values available)")
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(GROUND_CONFIG_FIELDS)
@@ -688,13 +719,13 @@ def triggerSafeMode():
 
 def initHardware():
     """Initialize all hardware and start all worker threads. Returns a status string."""
-    global relayController
+    global relayController, pxiSession
     errors = []
 
     startThread("TELEM")   # start logger first so all subsequent logMsg calls work
 
     try:
-        waves = initPXIE(PXI_IP)
+        pxiSession, waves = initPXIE(PXI_IP, timeout=PXI_CONNECT_TIMEOUT_MS)
         pxiWaves.extend(waves)
         if waves:
             logMsg("INFO",
@@ -867,6 +898,8 @@ class PairControls(tk.Frame):
         self._bg      = bg
         self._vars    = {}
         self._entries = {}
+        self._scales  = {}
+        self._sl_bounds = {}
         self._build()
 
     def _build(self):
@@ -897,6 +930,8 @@ class PairControls(tk.Frame):
                 command=lambda v, k=key, f=fmt: self._push_to_entry(k, float(v), f),
             )
             scale.grid(row=1, column=c, padx=(2, 0), sticky="ew")
+            self._scales[key] = scale
+            self._sl_bounds[key] = (sl_min, sl_max)
 
             entry = tk.Entry(self, width=10, justify="center",
                              bg=BG_HL, fg=FG, insertbackground=FG,
@@ -923,11 +958,25 @@ class PairControls(tk.Frame):
         entry, fmt, lo, hi = self._entries[key]
         try:
             val = max(lo, min(hi, float(entry.get())))
-            self._vars[key].set(val)
-            entry.delete(0, "end")
-            entry.insert(0, format(val, fmt))
+            self._set_value(key, val, fmt)
         except ValueError:
             pass
+
+    def _set_value(self, key, val, fmt):
+        """Set var + slider + entry together, widening the slider's range if
+        the value falls outside its normal display bounds. Without this, a
+        tk.Scale silently clamps its linked variable back within from_/to,
+        which would corrupt the value actually sent to hardware."""
+        scale = self._scales[key]
+        sl_min, sl_max = self._sl_bounds[key]
+        if val < sl_min or val > sl_max:
+            scale.configure(from_=min(sl_min, val), to=max(sl_max, val))
+        else:
+            scale.configure(from_=sl_min, to=sl_max)
+        self._vars[key].set(val)
+        entry, _, _, _ = self._entries[key]
+        entry.delete(0, "end")
+        entry.insert(0, format(val, fmt))
 
     def _apply(self):
         if self._on_focus:
@@ -944,14 +993,17 @@ class PairControls(tk.Frame):
         """Public entry point used by 'Apply All Pairs'."""
         self._apply()
 
+    def get_values(self):
+        """Current freq/amp/offset/phase as shown in the sliders/entries."""
+        return (self._vars["freq"].get(), self._vars["amp"].get(),
+                self._vars["offset"].get(), self._vars["phase"].get())
+
     def load_values(self, freq, amp, offset, phase):
         """Populate sliders/entries from a saved config and immediately apply."""
         for key, val in (("freq", freq), ("amp", amp), ("offset", offset), ("phase", phase)):
-            entry, fmt, lo, hi = self._entries[key]
+            _, fmt, lo, hi = self._entries[key]
             clamped = max(lo, min(hi, val))
-            self._vars[key].set(clamped)
-            entry.delete(0, "end")
-            entry.insert(0, format(clamped, fmt))
+            self._set_value(key, clamped, fmt)
         self._apply()
 
 
@@ -1143,10 +1195,16 @@ class LXIManagerWindow(tk.Toplevel):
                     seen_ids[cid] = len(seen_ids)
                     try:
                         model = card.CardId()
-                        bus, slot = card.CardLoc()
                     except Exception as e:
                         model = f"Error: {e}"
+                        _lxi_append_error(f"card {seen_ids[cid]} CardId() failed: {e!r}")
+                        logMsg("ERROR", f"LXI card {seen_ids[cid]} CardId() failed: {e!r}")
+                    try:
+                        bus, slot = card.CardLoc()
+                    except Exception as e:
                         bus, slot = "?", "?"
+                        _lxi_append_error(f"card {seen_ids[cid]} CardLoc() failed: {e!r}")
+                        logMsg("ERROR", f"LXI card {seen_ids[cid]} CardLoc() failed: {e!r}")
                     rows.append({
                         "idx":   seen_ids[cid],
                         "model": model,
@@ -1752,8 +1810,9 @@ class GroundControllerApp(tk.Tk):
             logMsg("WARNING", "Save config: no name entered")
             return
         safe_name = re.sub(r"[^A-Za-z0-9_\- ]", "_", name)
+        gui_values = [ctrl.get_values() for ctrl in self._pair_controls]
         try:
-            path = saveGroundConfig(safe_name)
+            path = saveGroundConfig(safe_name, gui_values=gui_values)
             logMsg("INFO", f"Ground config saved: {path}")
             self._refresh_config_dropdown()
             self._config_var.set(safe_name)
@@ -1769,6 +1828,9 @@ class GroundControllerApp(tk.Tk):
             rows = loadGroundConfig(name)
         except Exception as e:
             logMsg("ERROR", f"Failed to load ground config '{name}': {e}")
+            return
+        if not rows:
+            logMsg("WARNING", f"Ground config '{name}' has no saved pairs — nothing to load")
             return
         for pair_idx, row in enumerate(rows):
             if pair_idx >= len(self._pair_controls):

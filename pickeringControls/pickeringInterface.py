@@ -149,14 +149,24 @@ def readAllConfigs(configFilePaths):
     return [readConfigs(path) for path in configFilePaths]
 
 
-def initPXIE(ip_address="pxi"):
-    #Initalizes PXI interface and returns a list of open card objects.
+def initPXIE(ip_address="pxi", timeout=5000):
+    #Initalizes PXI interface and returns (session, list of waveAtributes).
+    # timeout (ms) is the TCP connect timeout — the default pilxi value (1000ms)
+    # is too short for a chassis that is still booting.
+    #
+    # NOTE: the returned session object MUST be kept alive by the caller for as
+    # long as the cards/waveforms are in use. Pi_Session.__del__ disconnects the
+    # LXI session, which invalidates every card opened from it — if the caller
+    # lets `session` go out of scope, Python garbage-collects it almost
+    # immediately (nothing else holds a Python reference to it; cards only keep
+    # the raw session handle, not the Pi_Session wrapper) and every card goes
+    # invalid ("Invalid session ID") a moment later.
 
-    session = pilxi.Pi_Session(ip_address)
+    session = pilxi.Pi_Session(ip_address, timeout=timeout)
 
     if session is None:
         log.error("Failed to initialize PXI interface.")
-        return None
+        return None, []
     else:
         log.info("PXI interface initialized successfully.")
 
@@ -172,7 +182,7 @@ def initPXIE(ip_address="pxi"):
             log.error("Exception occurred: %s", ex.message)
     log.info(f"Found {len(cards)} valid cards.")
     cardWaves = buildWaveforms(cards)
-    return cardWaves
+    return session, cardWaves
 
 
 def updateWaveform(card, wave: waveAtributes):

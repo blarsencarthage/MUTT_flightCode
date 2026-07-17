@@ -56,7 +56,8 @@ JOIN_TIMEOUT         = 3.0         # s to wait on a thread during shutdown
 WORKER_GET_TIMEOUT   = 0.2         # s — every queue.get uses this, never blocks
 
 PXI_HEALTH_INTERVAL  = 5.0         # s between PXI connection ping checks
-PXI_REINIT_LIMIT     = 3           # failed reinit attempts before safe mode
+PXI_CONNECT_TIMEOUT_MS = 5000      # ms — Pi_Session TCP connect timeout (chassis can be slow to boot)
+PXI_RECONNECT_BACKOFF  = [5.0, 10.0, 30.0, 60.0]  # s — escalating delay between reinit attempts; holds at last value
 # ---------------------------------------------------------------------------
 # Shared state — the ONLY mutable state shared across threads
 # ---------------------------------------------------------------------------
@@ -76,12 +77,14 @@ threads        = {}                   # threadName -> live threading.Thread
 
 pxiLock        = threading.Lock()    # protects pxiWaves during watchdog reinit
 pxiReinitCount = 0                   # failed PXI reinit attempts
+pxiNextReinitTime = 0.0              # monotonic time — reinitPXI() skipped until this passes
 flightPhase = {"preLaunch": True, "SEP": False, "zgStart": False, "zgStop": False}        # current flight phase (for logging / telemetry)
 
 # ---------------------------------------------------------------------------
 # Hardware handles — populated by initHardware(), consumed by the workers
 # ---------------------------------------------------------------------------
 pxiWaves      = []     # list of waveAtributes (3 per card) returned by initPXIE()
+pxiSession    = None   # Pi_Session — must be kept alive; __del__ tears down the LXI session
 relaySer      = None   # serial.Serial to the Numato board
 craftListener = None   # craftSerial.RS422 instance
 craftController = None  # relayControls.RelayController instance
@@ -416,19 +419,20 @@ def reinitPXI():
     """Close all existing card handles and re-run initPXIE().
 
     Replaces pxiCards in-place under pxiLock so the PXI worker always sees a
-    consistent list. Increments pxiReinitCount; triggers safe mode when the
-    limit is exceeded.
+    consistent list. A slow-booting LXI chassis can take well over a minute
+    to come up, so a failed attempt here backs off and tries again rather
+    than permanently giving up — pxiReinitCount only drives the backoff
+    delay and no longer trips safe mode on its own.
     """
-    global pxiWaves, pxiReinitCount
-    pxiReinitCount += 1
-
-    if pxiReinitCount > PXI_REINIT_LIMIT:
-        logMsg("CRITICAL",
-               f"PXI reinit exceeded {PXI_REINIT_LIMIT} attempts — safe mode")
-        triggerSafeMode()
+    global pxiWaves, pxiSession, pxiReinitCount, pxiNextReinitTime
+    now = time.monotonic()
+    if now < pxiNextReinitTime:
         return
+    pxiReinitCount += 1
+    delay = PXI_RECONNECT_BACKOFF[min(pxiReinitCount - 1, len(PXI_RECONNECT_BACKOFF) - 1)]
+    pxiNextReinitTime = now + delay
 
-    logMsg("WARNING", f"PXI reinit attempt {pxiReinitCount}")
+    logMsg("WARNING", f"PXI reinit attempt {pxiReinitCount} (next retry in {delay:.0f}s if this fails)")
 
     # Close unique card handles before rebuilding — ignore errors on close.
     with pxiLock:
@@ -442,14 +446,22 @@ def reinitPXI():
                 except Exception:
                     pass
         pxiWaves.clear()
+        if pxiSession is not None:
+            try:
+                pxiSession.Close()
+            except Exception:
+                pass
+            pxiSession = None
 
         try:
-            newWaves = PI.initPXIE()
+            newSession, newWaves = PI.initPXIE(timeout=PXI_CONNECT_TIMEOUT_MS)
             if newWaves:
+                pxiSession = newSession
                 pxiWaves.extend(newWaves)
                 n_cards = len(pxiWaves) // 3
                 logMsg("INFO", f"PXI reinit succeeded: {n_cards} card(s) restored")
                 pxiReinitCount = 0   # reset count on a clean recovery
+                pxiNextReinitTime = 0.0
             else:
                 logMsg("ERROR", "PXI reinit returned no waves")
         except Exception as e:
@@ -559,12 +571,12 @@ def initHardware():
     Returns True on success. Failures are logged; decide per-device whether a
     failure is fatal as the self-checks are fleshed out.
     """
-    global pxiWaves, relaySer, craftListener, craftController, waveConfigs
+    global pxiWaves, pxiSession, relaySer, craftListener, craftController, waveConfigs
     ok = True
 
     # --- Pickering PXI cabinet + function-generator self-check ---
     try:
-        pxiWaves = PI.initPXIE()
+        pxiSession, pxiWaves = PI.initPXIE(timeout=PXI_CONNECT_TIMEOUT_MS)
         waveConfigs = PI.readAllConfigs(CONFIG_FILE_PATHS)
 
         # TODO: PI.waveformSelfCheck([w._card for w in pxiWaves]) and act on the result
