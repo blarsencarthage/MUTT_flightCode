@@ -5,6 +5,7 @@
 import os
 import sys
 import csv
+import time
 _pkg_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_pkg_dir, "pilxi-5.7"))
 #TODO: Revise waveAtributes class to include the card address and channel number, bring
@@ -13,6 +14,13 @@ import pilxi
 import pi620lx
 import logging
 log = logging.getLogger("mutt.LXI")
+
+# Substring expected in CardId() for a Pickering 41-620 function generator card.
+# initPXIE() treats every free card as a 3-channel 41-620 regardless of this —
+# it only uses it to warn loudly when a free card doesn't look like one, since
+# FindFreeCards() returns ALL free cards in the chassis regardless of type.
+FG_CARD_ID_HINT = "620"
+
 _WAVEFORM_TYPE_MAP = {
     "SINE":      pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE,
     "SQUARE":    pilxi.WaveformTypes.PIFGLX_WAVEFORM_SQUARE,
@@ -170,7 +178,66 @@ def initPXIE(ip_address="pxi", timeout=5000):
     else:
         log.info("PXI interface initialized successfully.")
 
-    freeCards = session.FindFreeCards() #Returns a list of tuples (bus, device) for each free card found.
+    # CountFreeCards() and FindFreeCards() both funnel driver errors through
+    # the same message decoder, so a failure from either looks identical from
+    # the caller's side. Call CountFreeCards() on its own first so the log
+    # says which one actually broke: if CountFreeCards() itself fails, the
+    # session is unusable and retrying the enumeration call won't help — hand
+    # back to the caller's reinit backoff. If it succeeds with 0, there's
+    # nothing to enumerate (cards may be claimed elsewhere, or the chassis
+    # hasn't finished booting) and calling FindFreeCards() is skipped entirely
+    # rather than risking whatever it does with a zero-count buffer.
+    try:
+        freeCount = session.CountFreeCards()
+    except pilxi.Error as ex:
+        log.error(f"CountFreeCards() failed: {ex.message} — session is not usable right now.")
+        return session, []
+
+    if freeCount == 0:
+        log.warning("Chassis reports 0 free cards right now (cards may be claimed by another "
+                    "session/process, or the chassis is still enumerating after connect).")
+        freeCards = []
+    else:
+        freeCards = None
+        for attempt in (1, 2):
+            try:
+                freeCards = session.FindFreeCards() #Returns a list of tuples (bus, device) for each free card found.
+                break
+            except pilxi.Error as ex:
+                if attempt == 1:
+                    log.warning(f"FindFreeCards() failed despite CountFreeCards() reporting "
+                                f"{freeCount} free ({ex.message}) — retrying in 1s.")
+                    time.sleep(1.0)
+                else:
+                    log.error(f"FindFreeCards() failed again: {ex.message}")
+                    return session, []
+
+    try:
+        totalCards = session.GetTotalCardsCount()
+        if totalCards != len(freeCards):
+            log.warning(
+                f"Chassis reports {totalCards} total card(s) but only {len(freeCards)} "
+                f"are free — {totalCards - len(freeCards)} card(s) are claimed by another "
+                f"session/process and will NOT be opened here.")
+            # Identify what's actually holding them, rather than just guessing.
+            # A card claimed by a session that never disconnected cleanly (e.g.
+            # this same app force-killed mid-run on a previous attempt) shows up
+            # here and can be force-released without power-cycling the chassis.
+            try:
+                foreign = session.GetForeignSessions()
+                if foreign:
+                    log.warning(f"Other live session(s) on this LXI unit: {foreign} — one of "
+                                f"these likely holds the missing card(s). If this app was "
+                                f"previously force-killed rather than closed normally, this is "
+                                f"probably a leftover session from that run.")
+                else:
+                    log.warning("No other foreign sessions reported by the driver, yet cards "
+                                 "are still not free — check for another running instance of "
+                                 "this app, or a locked card that needs a chassis reboot to clear.")
+            except pilxi.Error as ex:
+                log.warning(f"Could not enumerate foreign sessions: {ex.message}")
+    except pilxi.Error as ex:
+        log.warning(f"Could not read total card count: {ex.message}")
 
     cards = []
     for bus, device in freeCards: #Opens sessions with each free card and appends them to the cards list.
@@ -178,6 +245,21 @@ def initPXIE(ip_address="pxi", timeout=5000):
             card = session.OpenCard(bus, device) #Returns a Pi_Card_ByDevice object
             card.ClearCard()
             cards.append(card)
+            try:
+                model = card.CardId()
+            except pilxi.Error as ex:
+                model = f"<CardId() failed: {ex.message}>"
+            if FG_CARD_ID_HINT not in model:
+                log.warning(
+                    f"Card at bus={bus} device={device} reports model '{model}', which does "
+                    f"NOT look like a {FG_CARD_ID_HINT!r} function-generator card. It will "
+                    f"still be treated as a 3-channel waveform generator and PIFGLX_* calls "
+                    f"will be sent to it — if those calls fail, this is very likely why: the "
+                    f"wrong card type is being commanded. Check what's physically in this "
+                    f"chassis slot and whether the real function generator card is present "
+                    f"but not free (see total-vs-free card count above).")
+            else:
+                log.info(f"Card at bus={bus} device={device}: {model}")
         except pilxi.Error as ex:
             log.error("Exception occurred: %s", ex.message)
     log.info(f"Found {len(cards)} valid cards.")
