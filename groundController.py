@@ -1472,8 +1472,15 @@ class GroundControllerApp(tk.Tk):
                                     bg=BG, fg=YELLOW, font=("Helvetica", 9))
         self._status_lbl.pack(side="right")
 
+        # Everything below the title bar lives in a scrollable region so that
+        # nothing (e.g. the LXI/Relay Manager buttons) gets clipped off the
+        # bottom of the screen if the content is taller than the display.
+        main_scroll = ScrollFrame(self)
+        main_scroll.pack(fill="both", expand=True)
+        content = main_scroll.inner
+
         # Body: array diagram (left) | status panels (right)
-        body = tk.Frame(self, bg=BG)
+        body = tk.Frame(content, bg=BG)
         body.pack(fill="x", padx=10, pady=4)
 
         left = tk.Frame(body, bg=BG, width=300)
@@ -1491,7 +1498,7 @@ class GroundControllerApp(tk.Tk):
         self._build_thread_panel(right)
 
         # Pair controls
-        ctrl_frame = tk.LabelFrame(self, text="Pair Controls",
+        ctrl_frame = tk.LabelFrame(content, text="Pair Controls",
                                    bg=BG, fg=FG, font=("Helvetica", 9, "bold"),
                                    padx=4, pady=4)
         ctrl_frame.pack(fill="x", padx=10, pady=4)
@@ -1507,7 +1514,7 @@ class GroundControllerApp(tk.Tk):
             self._pair_controls.append(ctrl)
 
         # Ground config save/load bar
-        cfg_frame = tk.LabelFrame(self, text="Ground Configs",
+        cfg_frame = tk.LabelFrame(content, text="Ground Configs",
                                   bg=BG, fg=FG, font=("Helvetica", 9, "bold"),
                                   padx=8, pady=4)
         cfg_frame.pack(fill="x", padx=10, pady=4)
@@ -1535,7 +1542,7 @@ class GroundControllerApp(tk.Tk):
         self._refresh_config_dropdown()
 
         # Action bar
-        action = tk.Frame(self, bg=BG)
+        action = tk.Frame(content, bg=BG)
         action.pack(fill="x", padx=10, pady=(0, 4))
         for label, cmd in [("Apply All Pairs", self._apply_all),
                             ("Stop All",        self._stop_all)]:
@@ -1553,14 +1560,14 @@ class GroundControllerApp(tk.Tk):
                   command=self._open_relay_manager).pack(side="left", padx=(0, 10))
 
         # LXI channel table
-        lxi_frame = tk.LabelFrame(self, text="LXI Function Generators",
+        lxi_frame = tk.LabelFrame(content, text="LXI Function Generators",
                                   bg=BG, fg=FG, font=("Helvetica", 9, "bold"),
                                   padx=6, pady=4)
         lxi_frame.pack(fill="x", padx=10, pady=4)
         self._build_lxi_panel(lxi_frame)
 
         # Log pane
-        log_frame = tk.LabelFrame(self, text="Log",
+        log_frame = tk.LabelFrame(content, text="Log",
                                   bg=BG, fg=FG, font=("Helvetica", 9, "bold"),
                                   padx=4, pady=4)
         log_frame.pack(fill="both", expand=True, padx=10, pady=(4, 8))
