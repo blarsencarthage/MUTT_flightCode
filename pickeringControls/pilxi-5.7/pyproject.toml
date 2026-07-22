@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Pilxi"
+version = "5.7"
+description = "Python wrapper Library for Pickering LXI ClientBridge driver"
+readme = "README.md"
+license = {file = "LICENSE.txt"}
+authors = [
+    {name = "Pickering Interfaces", email = "support@pickeringtest.com"}
+]
+
+
+[project.urls]
+homepage = "https://pickeringtest.info/downloads/drivers/Sys60/"
+
+[tool.setuptools.packages.find]
+exclude = ["docs*", "tools*"]
