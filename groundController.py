@@ -23,9 +23,28 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(_HERE, "spacecraftSerial"))
 
-from pickeringControls.pickeringInterface import initPXIE, updateWaveform, waveAtributes, abortGeneration
+from pickeringControls.pickeringInterfaceV2 import pickeringHeader
 from relayControls.relaySerial import RelayController
 import serial
+
+# 41-620 attenuator: 0 dB = full-scale output, per py620 readme's documented
+# 0-40 dB attenuation range. Full-scale output is 20 Vpp. pickeringHeader's
+# phasedArray.channel.amplitude is dB (what card.setAttenuation() wants) —
+# these convert to/from the volts the GUI slider is calibrated in.
+_FULL_SCALE_VOLTS   = 20.0
+_ATTENUATION_DB_MIN = 0.0
+_ATTENUATION_DB_MAX = 40.0
+
+
+def _dbFromVolts(volts):
+    if volts <= 0:
+        return _ATTENUATION_DB_MAX
+    db = 20.0 * math.log10(_FULL_SCALE_VOLTS / volts)
+    return max(_ATTENUATION_DB_MIN, min(_ATTENUATION_DB_MAX, db))
+
+
+def _voltsFromDb(db):
+    return _FULL_SCALE_VOLTS * (10 ** (-db / 20.0))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HARDWARE CONFIGURATION
@@ -62,20 +81,17 @@ TRANSDUCER_PAIR = [2, 3, 4, 0, 1, 5, 5, 1, 0, 4, 3, 2]
 PARAMS = [
     ("freq",   "Freq (Hz)",  100.0, 1_000_000.0, 40_000.0, 1_000.0, 200_000.0, ".0f"),
     # "Amp" is entered in volts and converted to dB attenuation via
-    # waveAtributes.setAmplitudeVolts() (card.setAttenuation() itself only
-    # takes dB) — range is 0-20V, the 41-620's full-scale output.
+    # _dbFromVolts() (card.setAttenuation() itself only takes dB) — range is
+    # 0-20V, the 41-620's full-scale output.
     ("amp",    "Amp (V)",      0.0,        20.0,     10.0,     0.0,      20.0,  ".3f"),
     ("offset", "Offset (V)",   0.0,         5.0,      0.0,     0.0,       5.0,  ".3f"),
     ("phase",  "Phase (°)",    0.0,       360.0,      0.0,     0.0,     360.0,  ".1f"),
 ]
 
 
-# Matches pi620lx.Base/Card.signalShapes (SINE=0, TRIANGLE=1, SQUARE=2) — note
-# TRIANGLE/SQUARE are swapped relative to the old pilxi.WaveformTypes enum.
-# RAMP/DC/PULSE/PWM/ARB have no pi620lx equivalent and are no longer supported.
-WAVEFORM_NAMES = {
-    0: "SINE", 1: "TRIANGLE", 2: "SQUARE",
-}
+# pickeringHeader.phasedArray.channel.waveform_type is already a string
+# ("SINE"/"TRIANGLE"/"SQUARE") — see pickeringInterfaceV2's _WAVEFORM_TYPE_MAP.
+# RAMP/DC/PULSE/PWM/ARB have no pi620lx equivalent and are not supported.
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PORT / TIMING CONSTANTS
@@ -94,7 +110,6 @@ HEARTBEAT_TIMEOUT  = 5.0    # s — staleness threshold
 PXI_HEALTH_INTERVAL = 5.0   # s — PXI ping cadence
 MAX_RESTARTS       = 3      # max auto-restarts before safe mode
 PXI_CONNECT_TIMEOUT_MS = 5000            # ms — Pi_Session TCP connect timeout (chassis can be slow to boot)
-PXI_RECONNECT_BACKOFF  = [5.0, 10.0, 30.0, 60.0]  # s — escalating delay between reinit attempts; holds at last value
 QUEUE_DEPTH_WARN   = 10
 QUEUE_DEPTH_ALARM  = 50
 
@@ -190,8 +205,15 @@ def _emitLog(level, message):
 # SHARED STATE
 # ══════════════════════════════════════════════════════════════════════════════
 
-pxiWaves:       list          = []               # waveAtributes × 6 (3 per card)
-pxiSession                    = None              # Pi_Session — must be kept alive; __del__ tears down the LXI session
+pxiHeader:      pickeringHeader = None            # owns session/cards/relayCard/phasedArray; recreated on IP change/reinit
+pxiRunState:    str            = "IDLE"           # IDLE (disarmed) / ARMED (waiting on trigger) / RUNNING (triggered)
+
+
+def _setRunState(state):
+    global pxiRunState
+    pxiRunState = state
+
+
 relayStates:    list          = [False] * NUM_RELAYS
 signalStates:   dict          = {name: False for name in SIGNAL_NAMES}
 threads:        dict          = {}               # name → Thread
@@ -204,8 +226,8 @@ pxiQueue:       queue.Queue   = queue.Queue()
 relayQueue:     queue.Queue   = queue.Queue()
 logQueue:       queue.Queue   = queue.Queue()
 restartCounts:  dict          = {}
-pxiReinitCount: int           = 0
-pxiNextReinitTime: float      = 0.0  # monotonic time — reinitPXI() skipped until this passes
+pxiReinitCount: int           = 0    # operator-triggered reinits (IP change / manual reinit); informational only —
+                                      # pickeringHeader's own monitor thread retries connection on a fixed interval
 relayController: RelayController = None
 lxiErrors:      list          = []   # timestamped error strings (newest last, max 200)
 _lxiManagerWindow = None             # singleton Toplevel reference
@@ -244,8 +266,44 @@ def updateHeartbeat(name):
 # WORKER THREADS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _waveIdx(pair_idx):
+    card_idx, ch_num = CHANNEL_MAP[pair_idx]
+    return card_idx * 3 + (ch_num - 1)
+
+
+def _notifyPair(pair_idx, channel, status):
+    """Fire a channel_update stateBus event from a phasedArray.channel + a
+    software-tracked status (IDLE/ARMED/RUNNING) — pickeringHeader/pi620lx has
+    no live read-back, so this always reflects the last-commanded state."""
+    stateBus._notify("channel_update", {
+        "pair": pair_idx,
+        "freq": channel.frequency, "amp": _voltsFromDb(channel.amplitude),
+        "offset": channel.offset, "phase": channel.phase,
+        "waveform": channel.waveform_type, "status": status,
+        "generating": status == "RUNNING",
+    })
+
+
+def _notifyAllPairs(status):
+    for p in range(NUM_PAIRS):
+        w_idx = _waveIdx(p)
+        if pxiHeader is not None and w_idx < len(pxiHeader.phasedArray.channels):
+            _notifyPair(p, pxiHeader.phasedArray.channels[w_idx], status)
+
+
 def pxi_worker():
-    """Dequeue waveform commands and apply them to the real PXI hardware."""
+    """Dequeue waveform/arm/trigger commands and apply them to the real PXI
+    hardware through pxiHeader.
+
+    "apply" only stages a pair's config (sendConfigToCards()) — it does not
+    make the array generate. sendConfigToCards() also outputOff()s every
+    channel as part of staging, so any apply always drops back to IDLE.
+    Generation only starts once "arm" (armFuncGens) then "trigger"
+    (triggerFuncGens) are run, which fire all 6 channels together off the
+    relay so their phases stay synchronized — that's the reason pickeringHeader
+    splits config/arm/trigger into three separate calls instead of one.
+    """
+    global pxiRunState
     name = "PXI"
     while not stopEvent.is_set():
         try:
@@ -258,64 +316,73 @@ def pxi_worker():
 
         if cmd == "apply" and len(item) == 6:
             _, pair_idx, freq, amp, offset, phase = item
-            card_idx, ch_num = CHANNEL_MAP[pair_idx]
-            wave_idx = card_idx * 3 + (ch_num - 1)
+            wave_idx = _waveIdx(pair_idx)
             with pxiLock:
-                if wave_idx < len(pxiWaves):
-                    wave = pxiWaves[wave_idx]
-                    wave.setFrequency(freq)
-                    wave.setAmplitudeVolts(amp)
-                    wave.setOffset(offset)
-                    wave.setPhase(phase)
+                if pxiHeader is not None and wave_idx < len(pxiHeader.phasedArray.channels):
+                    channel = pxiHeader.phasedArray.channels[wave_idx]
+                    channel.frequency = freq
+                    channel.amplitude = _dbFromVolts(amp)
+                    channel.offset = offset
+                    channel.phase = phase
                     try:
-                        updateWaveform(wave._card, wave)
-                        try:
-                            wf_name = WAVEFORM_NAMES.get(int(wave.getWaveformType()), "SINE")
-                        except Exception:
-                            wf_name = "SINE"
-                        stateBus._notify("channel_update", {
-                            "pair": pair_idx,
-                            "freq": freq, "amp": amp,
-                            "offset": offset, "phase": phase,
-                            "waveform": wf_name, "generating": True,
-                        })
+                        pxiHeader.sendConfigToCards()
+                        pxiRunState = "IDLE"
+                        _notifyPair(pair_idx, channel, "IDLE")
                         logMsg("INFO",
-                            f"PXI pair {pair_idx+1}: freq={freq:.0f}Hz "
-                            f"amp={amp:.3f}V offset={offset:.3f}V phase={phase:.1f}°")
+                            f"PXI pair {pair_idx+1}: staged freq={freq:.0f}Hz "
+                            f"amp={amp:.3f}V offset={offset:.3f}V phase={phase:.1f}° "
+                            f"(Arm + Trigger to generate)")
                     except Exception as e:
                         logMsg("ERROR", f"PXI apply pair {pair_idx+1}: {e}")
                         _lxi_append_error(f"apply pair {pair_idx+1}: {e}")
                 else:
                     logMsg("WARNING",
                         f"PXI pair {pair_idx+1}: wave index {wave_idx} "
-                        f"not available ({len(pxiWaves)} waveform(s) initialized)")
+                        f"not available (PXI not connected, or fewer than "
+                        f"{wave_idx+1} channel(s) configured)")
+
+        elif cmd == "arm":
+            with pxiLock:
+                if pxiHeader is not None:
+                    try:
+                        pxiHeader.armFuncGens()
+                        pxiRunState = "ARMED"
+                        _notifyAllPairs("ARMED")
+                        logMsg("INFO", "PXI: all channels armed, waiting on trigger")
+                    except Exception as e:
+                        logMsg("ERROR", f"PXI arm failed: {e}")
+                        _lxi_append_error(f"arm failed: {e}")
+                else:
+                    logMsg("WARNING", "PXI arm ignored: not connected")
+
+        elif cmd == "trigger":
+            with pxiLock:
+                if pxiHeader is not None:
+                    try:
+                        pxiHeader.triggerFuncGens()
+                        pxiRunState = "RUNNING"
+                        _notifyAllPairs("RUNNING")
+                        logMsg("INFO", "PXI: triggered — all armed channels generating")
+                    except Exception as e:
+                        logMsg("ERROR", f"PXI trigger failed: {e}")
+                        _lxi_append_error(f"trigger failed: {e}")
+                else:
+                    logMsg("WARNING", "PXI trigger ignored: not connected")
 
         elif cmd == "reinit":
-            reinitPXI(force=True)  # operator-requested — bypass the auto-retry backoff
+            reinitPXI(force=True)  # operator-requested — bypasses nothing now, always recreates the header
 
         elif cmd == "stop_all":
             with pxiLock:
-                for wave in pxiWaves:
+                if pxiHeader is not None:
                     try:
-                        abortGeneration(wave._card, wave.getChannel())
-                    except Exception:
-                        pass
-            for p in range(NUM_PAIRS):
-                c_idx, ch = CHANNEL_MAP[p]
-                w_idx = c_idx * 3 + (ch - 1)
-                if w_idx < len(pxiWaves):
-                    w = pxiWaves[w_idx]
-                    try:
-                        wf_name = WAVEFORM_NAMES.get(int(w.getWaveformType()), "SINE")
-                    except Exception:
-                        wf_name = "SINE"
-                    stateBus._notify("channel_update", {
-                        "pair": p,
-                        "freq": w.getFrequency(), "amp": w.getAmplitudeVolts(),
-                        "offset": w.getOffset(), "phase": w.getPhase(),
-                        "waveform": wf_name, "generating": False,
-                    })
-            logMsg("INFO", "PXI: all channels stopped")
+                        pxiHeader.disarmFuncGens()
+                    except Exception as e:
+                        logMsg("ERROR", f"PXI disarm failed: {e}")
+                        _lxi_append_error(f"disarm failed: {e}")
+                pxiRunState = "IDLE"
+                _notifyAllPairs("IDLE")
+            logMsg("INFO", "PXI: all channels disarmed/stopped")
 
         updateHeartbeat(name)
 
@@ -478,76 +545,49 @@ def restartThread(name):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def checkPXIHealth():
-    """Ping every open card. Returns True if all respond.
+    """Ping every open card. Returns True if connected and all respond.
 
     pi620lx.Card has no CardId() (unlike pilxi's Pi_Card_ByDevice) — uses
     revisionQuery() instead, a lightweight read over the PXI bus that still
     requires a live round-trip to the card.
     """
-    if not pxiWaves:
+    if pxiHeader is None or not pxiHeader.connectionStatus or not pxiHeader.cards:
         return False
-    seen = set()
-    for i, wave in enumerate(pxiWaves):
-        card = wave._card
-        if id(card) in seen:
-            continue
-        seen.add(id(card))
+    for i, card in enumerate(pxiHeader.cards):
         try:
             card.revisionQuery()
         except Exception as e:
-            logMsg("ERROR", f"PXI health: card {i // 3} not responding ({e})")
-            _lxi_append_error(f"health check card {i // 3}: {e}")
+            logMsg("ERROR", f"PXI health: card {i} not responding ({e})")
+            _lxi_append_error(f"health check card {i}: {e}")
             return False
     return True
 
 def reinitPXI(force=False):
-    """Close all card handles and re-run initPXIE() under pxiLock.
+    """Tear down the current pickeringHeader and create a new one under pxiLock.
 
-    A slow-booting LXI chassis can take well over a minute to come up, so a
-    failed attempt here backs off and tries again rather than permanently
-    giving up (unlike thread-crash restarts, which are capped by
-    MAX_RESTARTS/triggerSafeMode). pxiReinitCount only drives the backoff
-    delay; it never trips safe mode on its own. force=True (operator-requested
-    reinit) bypasses the backoff and retries immediately.
+    pickeringHeader owns its own background monitor thread that opens the LXI
+    connection immediately on construction and keeps retrying on a fixed
+    healthInterval afterward — there is no backoff to bypass here anymore
+    (unlike the old free-function initPXIE()-based reinit). This is
+    operator-triggered only (IP change / manual reinit button); the watchdog
+    never calls this automatically on a failed health check.
     """
-    global pxiWaves, pxiSession, pxiReinitCount, pxiNextReinitTime
-    now = time.monotonic()
-    if not force and now < pxiNextReinitTime:
-        return
+    global pxiHeader, pxiRunState, pxiReinitCount
     pxiReinitCount += 1
-    delay = PXI_RECONNECT_BACKOFF[min(pxiReinitCount - 1, len(PXI_RECONNECT_BACKOFF) - 1)]
-    pxiNextReinitTime = now + delay
-    logMsg("WARNING", f"PXI reinit attempt {pxiReinitCount} (next retry in {delay:.0f}s if this fails)")
+    logMsg("WARNING", f"PXI reinit #{pxiReinitCount}: recreating connection to {PXI_IP}")
     with pxiLock:
-        seen = set()
-        for wave in pxiWaves:
-            card = wave._card
-            if id(card) not in seen:
-                seen.add(id(card))
-                try:
-                    card.close()
-                except Exception:
-                    pass
-        pxiWaves.clear()
-        if pxiSession is not None:
+        if pxiHeader is not None:
             try:
-                pxiSession.Close()
-            except Exception:
-                pass
-            pxiSession = None
+                pxiHeader.closeLXI()
+            except Exception as e:
+                logMsg("ERROR", f"PXI reinit: error closing previous session: {e}")
         try:
-            new_session, new_waves = initPXIE(PXI_IP, timeout=PXI_CONNECT_TIMEOUT_MS)
-            if new_waves:
-                pxiSession = new_session
-                pxiWaves.extend(new_waves)
-                logMsg("INFO",
-                    f"PXI reinit OK: {len(new_waves) // 3} card(s) restored")
-                pxiReinitCount = 0
-                pxiNextReinitTime = 0.0
-            else:
-                logMsg("ERROR", "PXI reinit returned no waves")
-                _lxi_append_error("reinit returned no waves")
+            pxiHeader = pickeringHeader(PXI_IP, PXI_CONNECT_TIMEOUT_MS)
+            pxiRunState = "IDLE"
+            logMsg("INFO", f"PXI reinit: new pickeringHeader created for {PXI_IP} "
+                            f"(connecting in background)")
         except Exception as e:
+            pxiHeader = None
             logMsg("ERROR", f"PXI reinit failed: {e}")
             _lxi_append_error(f"reinit failed: {e}")
 
@@ -593,7 +633,8 @@ def listGroundConfigs():
 
 
 def saveGroundConfig(name, gui_values=None):
-    """Write the currently-applied hardware state (pxiWaves) to groundConfigs/<name>.csv.
+    """Write the currently-staged hardware state (pxiHeader.phasedArray) to
+    groundConfigs/<name>.csv.
 
     gui_values, if given, is a list of (freq, amp, offset, phase) indexed by
     pair_idx — used as a fallback for any pair whose hardware waveform isn't
@@ -604,18 +645,15 @@ def saveGroundConfig(name, gui_values=None):
     path = os.path.join(GROUND_CONFIGS_DIR, f"{name}.csv")
     rows = []
     with pxiLock:
+        channels = pxiHeader.phasedArray.channels if pxiHeader is not None else []
         for pair_idx in range(NUM_PAIRS):
             card_idx, ch_num = CHANNEL_MAP[pair_idx]
             wave_idx = card_idx * 3 + (ch_num - 1)
-            if wave_idx < len(pxiWaves):
-                wave = pxiWaves[wave_idx]
-                try:
-                    wf_name = WAVEFORM_NAMES.get(int(wave.getWaveformType()), "SINE")
-                except Exception:
-                    wf_name = "SINE"
+            if wave_idx < len(channels):
+                channel = channels[wave_idx]
                 rows.append([
-                    ch_num, wave.getFrequency(), wave.getAmplitudeVolts(),
-                    wave.getOffset(), wave.getPhase(), wf_name,
+                    ch_num, channel.frequency, _voltsFromDb(channel.amplitude),
+                    channel.offset, channel.phase, channel.waveform_type,
                 ])
             elif gui_values is not None and pair_idx < len(gui_values):
                 freq, amp, offset, phase = gui_values[pair_idx]
@@ -713,12 +751,10 @@ def triggerSafeMode():
 
     try:
         with pxiLock:
-            for wave in pxiWaves:
-                try:
-                    abortGeneration(wave._card, wave.getChannel())
-                except Exception:
-                    pass
-        logMsg("INFO", "Safe mode: PXI outputs zeroed")
+            if pxiHeader is not None:
+                pxiHeader.disarmFuncGens()
+            _setRunState("IDLE")
+        logMsg("INFO", "Safe mode: PXI outputs disarmed")
     except Exception as e:
         logMsg("ERROR", f"Safe mode PXI shutdown failed: {e}")
 
@@ -729,23 +765,34 @@ def triggerSafeMode():
 
 def initHardware():
     """Initialize all hardware and start all worker threads. Returns a status string."""
-    global relayController, pxiSession
+    global relayController, pxiHeader
     errors = []
 
     startThread("TELEM")   # start logger first so all subsequent logMsg calls work
 
     try:
-        pxiSession, waves = initPXIE(PXI_IP, timeout=PXI_CONNECT_TIMEOUT_MS)
-        pxiWaves.extend(waves)
-        if waves:
+        pxiHeader = pickeringHeader(PXI_IP, PXI_CONNECT_TIMEOUT_MS)
+        # pickeringHeader connects on its own background thread (see
+        # pickeringInterfaceV2_README.md); block briefly here — comparable to
+        # the old synchronous initPXIE() call — so the returned status
+        # reflects real connection state instead of always reporting 0 cards.
+        deadline = time.monotonic() + (PXI_CONNECT_TIMEOUT_MS / 1000.0) + 1.0
+        while time.monotonic() < deadline and not pxiHeader.connectionStatus:
+            time.sleep(0.1)
+        if pxiHeader.connectionStatus and pxiHeader.cards:
             logMsg("INFO",
-                f"PXI: {len(waves) // 3} card(s) initialized, {len(waves)} channels ready")
-        else:
-            logMsg("ERROR", f"PXI: connected to {PXI_IP} but found 0 free cards "
-                             f"(already claimed by another session?)")
-            _lxi_append_error(f"connected to {PXI_IP} but found 0 free cards "
+                f"PXI: {len(pxiHeader.cards)} card(s) initialized, "
+                f"{len(pxiHeader.phasedArray.channels)} channels ready")
+        elif pxiHeader.connectionStatus:
+            logMsg("ERROR", f"PXI: connected to {PXI_IP} but found 0 function "
+                             f"generator cards (already claimed by another session?)")
+            _lxi_append_error(f"connected to {PXI_IP} but found 0 cards "
                                f"(already claimed by another session?)")
             errors.append("PXI: 0 cards found")
+        else:
+            logMsg("WARNING", f"PXI: still connecting to {PXI_IP} in the "
+                               f"background — check LXI Manager for status")
+            errors.append("PXI: connecting")
     except Exception as e:
         logMsg("ERROR", f"PXI init failed: {e}")
         _lxi_append_error(f"startup init failed (IP {PXI_IP}): {e}")
@@ -770,7 +817,7 @@ def initHardware():
 
     if errors:
         return "Partial init — " + "; ".join(errors)
-    n = len(pxiWaves) // 3
+    n = len(pxiHeader.cards)
     return f"Ready — {n} PXI card{'s' if n != 1 else ''}"
 
 
@@ -896,8 +943,11 @@ class PairControls(tk.Frame):
     """Slider + entry controls for one transducer pair.
 
     Clicking Apply puts an ("apply", pair_idx, freq, amp, offset, phase) tuple
-    on pxiQueue. The pxi_worker picks it up, calls updateWaveform() on the real
-    hardware, and fires a stateBus "channel_update" event so the LXI table refreshes.
+    on pxiQueue. The pxi_worker picks it up, stages the values onto
+    pxiHeader (sendConfigToCards()), and fires a stateBus "channel_update"
+    event so the LXI table refreshes. This only stages the config — it does
+    not make the array generate; use the main window's Arm + Trigger buttons
+    for that (see pxi_worker's docstring).
     """
 
     def __init__(self, parent, pair_idx, on_focus=None, **kw):
@@ -1170,18 +1220,20 @@ class LXIManagerWindow(tk.Toplevel):
         if not self.winfo_exists():
             return
 
-        # Connection status derived from pxiWaves length
+        # Connection status derived from pxiHeader directly
         with pxiLock:
-            n_waves = len(pxiWaves)
-        n_cards = n_waves // 3
-        if n_waves > 0:
+            connected = pxiHeader is not None and pxiHeader.connectionStatus
+            n_cards = len(pxiHeader.cards) if pxiHeader is not None else 0
+            has_relay = pxiHeader is not None and pxiHeader.relayCard is not None
+        if connected:
             self._status_dot.config(fg=GREEN)
             self._status_lbl.config(text="CONNECTED", fg=GREEN)
         else:
             self._status_dot.config(fg=RED)
             self._status_lbl.config(text="OFFLINE", fg=RED)
         self._info_lbl.config(
-            text=f"Cards: {n_cards}  |  Reinit count: {pxiReinitCount}  |  IP: {PXI_IP}")
+            text=f"Cards: {n_cards}  |  Relay: {'found' if has_relay else 'missing'}  |  "
+                 f"Reinit count: {pxiReinitCount}  |  IP: {PXI_IP}")
         if self.focus_get() is not self._ip_entry:
             self._ip_var.set(PXI_IP)
 
@@ -1206,24 +1258,32 @@ class LXIManagerWindow(tk.Toplevel):
         pi620lx.Card has no CardId()/CardLoc() (unlike pilxi's
         Pi_Card_ByDevice) and no PIFGLX_Get* read-back, so this can no longer
         show a live per-channel generator status table — only the bus/device
-        location initPXIE() stamped onto each card (card._bus/_device) plus a
-        static model label, since pi620lx.Base.findCards() only ever returns
-        41-620 cards by construction. The main window's per-pair display
-        still echoes the last commanded value only.
+        location pickeringHeader stamped onto each card (card._bus/_device)
+        plus a static model label, since pi620lx.Base.findCards() only ever
+        returns 41-620 cards by construction. The main window's per-pair
+        display still echoes the last commanded value only. The relay card
+        (40-115) is shown as its own row since it's identified separately
+        from the FG cards.
         """
         rows = []
         with pxiLock:
-            seen_ids = {}
-            for wave in pxiWaves:
-                card = wave._card
-                cid = id(card)
-                if cid not in seen_ids:
-                    seen_ids[cid] = len(seen_ids)
+            if pxiHeader is not None:
+                for idx, card in enumerate(pxiHeader.cards):
                     bus = getattr(card, "_bus", "?")
                     device = getattr(card, "_device", "?")
                     rows.append({
-                        "idx":    seen_ids[cid],
+                        "idx":    idx,
                         "model":  "41-620 FG",
+                        "bus":    str(bus),
+                        "slot":   str(device),
+                        "ts":     time.strftime("%H:%M:%S"),
+                    })
+                if pxiHeader.relayCard is not None:
+                    bus = getattr(pxiHeader.relayCard, "_bus", "?")
+                    device = getattr(pxiHeader.relayCard, "_device", "?")
+                    rows.append({
+                        "idx":    len(pxiHeader.cards),
+                        "model":  "40-115 Relay",
                         "bus":    str(bus),
                         "slot":   str(device),
                         "ts":     time.strftime("%H:%M:%S"),
@@ -1619,12 +1679,27 @@ class GroundControllerApp(tk.Tk):
         # Action bar
         action = tk.Frame(content, bg=BG)
         action.pack(fill="x", padx=10, pady=(0, 4))
-        for label, cmd in [("Apply All Pairs", self._apply_all),
-                            ("Stop All",        self._stop_all)]:
+        for label, cmd in [("Apply All Pairs", self._apply_all)]:
             tk.Button(action, text=label, bg=BG_HL, fg=FG, relief="flat",
                       padx=12, pady=5,
                       activebackground="#4e4e70", activeforeground=FG,
                       command=cmd).pack(side="left", padx=(0, 10))
+        # Arm/Trigger/Stop drive pxiHeader.armFuncGens()/triggerFuncGens()/
+        # disarmFuncGens() — all 6 channels together, since triggering fires
+        # the shared relay once for every armed channel (that's what keeps
+        # their phases synchronized). "Apply All Pairs" only stages config.
+        tk.Button(action, text="Arm", bg=BG_HL, fg=YELLOW, relief="flat",
+                  padx=12, pady=5,
+                  activebackground=YELLOW, activeforeground=BG,
+                  command=self._arm_all).pack(side="left", padx=(0, 10))
+        tk.Button(action, text="Trigger", bg=BG_HL, fg=GREEN, relief="flat",
+                  padx=12, pady=5,
+                  activebackground=GREEN, activeforeground=BG,
+                  command=self._trigger_all).pack(side="left", padx=(0, 10))
+        tk.Button(action, text="Stop All", bg=BG_HL, fg=RED, relief="flat",
+                  padx=12, pady=5,
+                  activebackground=RED, activeforeground=BG,
+                  command=self._stop_all).pack(side="left", padx=(0, 10))
         tk.Button(action, text="LXI Manager…", bg=BG_HL, fg=BLUE, relief="flat",
                   padx=12, pady=5,
                   activebackground=BLUE, activeforeground=BG,
@@ -1790,10 +1865,9 @@ class GroundControllerApp(tk.Tk):
                 row[5].config(text=f"{data['amp']:.3f}")
                 row[6].config(text=f"{data['offset']:.3f}")
                 row[7].config(text=f"{data['phase']:.1f}")
-                generating = data.get("generating", False)
-                row[8].config(
-                    text="RUNNING" if generating else "IDLE",
-                    fg=GREEN if generating else FG_DIM)
+                status = data.get("status", "IDLE")
+                status_fg = {"RUNNING": GREEN, "ARMED": YELLOW}.get(status, FG_DIM)
+                row[8].config(text=status, fg=status_fg)
 
         elif event == "relay_update":
             i = data.get("relay", 0)
@@ -1814,6 +1888,12 @@ class GroundControllerApp(tk.Tk):
     def _apply_all(self):
         for ctrl in self._pair_controls:
             ctrl.apply()
+
+    def _arm_all(self):
+        pxiQueue.put(("arm",))
+
+    def _trigger_all(self):
+        pxiQueue.put(("trigger",))
 
     def _stop_all(self):
         pxiQueue.put(("stop_all",))
