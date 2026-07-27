@@ -1,3 +1,4 @@
+setup.cfg
 setup.py
 py620/__init__.py
 py620.egg-info/PKG-INFO

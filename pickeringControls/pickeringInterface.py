@@ -1,11 +1,19 @@
 
 #Author: Braedon Larsen
 #Created: 6.11.26
-#Updated 6.23.26
+#Updated 7.17.26 — switched from pilxi's generic PIFGLX_* card interface to the
+#vendor-supplied pi620lx wrapper (see test01 in this directory, provided by
+#Pickering support), which is the methodology that actually works with the
+#41-620 cards in this chassis. pilxi is still used for the LXI session itself
+#(pi620lx.Base needs a session ID from it) but no PIFGLX_* / Pi_Session.OpenCard
+#calls are made anymore — see pickeringREADME.md for the full list of behavior
+#changes this brought (dropped live read-back, dropped CardId()/CardLoc(),
+#amplitude now means dB attenuation, frequency now means kHz, new symmetry
+#field).
 import os
 import sys
 import csv
-import time
+import math
 _pkg_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_pkg_dir, "pilxi-5.7"))
 #TODO: Revise waveAtributes class to include the card address and channel number, bring
@@ -15,31 +23,67 @@ import pi620lx
 import logging
 log = logging.getLogger("mutt.LXI")
 
-# Substring expected in CardId() for a Pickering 41-620 function generator card.
-# initPXIE() treats every free card as a 3-channel 41-620 regardless of this —
-# it only uses it to warn loudly when a free card doesn't look like one, since
-# FindFreeCards() returns ALL free cards in the chassis regardless of type.
-FG_CARD_ID_HINT = "620"
-
+# pi620lx.Base/Card.signalShapes only defines these three — hardcoded here
+# (rather than pulled from a Base/Card instance) since the values are fixed
+# and this map needs to exist before any card is opened. RAMP/DC/PULSE/PWM/ARB
+# (previously supported via pilxi.WaveformTypes) have no pi620lx equivalent
+# and are not supported — any of those keys falls back to SINE, same as any
+# other unrecognized key.
 _WAVEFORM_TYPE_MAP = {
-    "SINE":      pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE,
-    "SQUARE":    pilxi.WaveformTypes.PIFGLX_WAVEFORM_SQUARE,
-    "TRIANGLE":  pilxi.WaveformTypes.PIFGLX_WAVEFORM_TRIANGLE,
-    "RAMP":      pilxi.WaveformTypes.PIFGLX_WAVEFORM_RAMP_UP,
-    "RAMP_UP":   pilxi.WaveformTypes.PIFGLX_WAVEFORM_RAMP_UP,
-    "RAMP_DOWN": pilxi.WaveformTypes.PIFGLX_WAVEFORM_RAMP_DOWN,
-    "DC":        pilxi.WaveformTypes.PIFGLX_WAVEFORM_DC,
-    "PULSE":     pilxi.WaveformTypes.PIFGLX_WAVEFORM_PULSE,
-    "PWM":       pilxi.WaveformTypes.PIFGLX_WAVEFORM_PWM,
-    "ARB":       pilxi.WaveformTypes.PIFGLX_WAVEFORM_ARB,
+    "SINE":     0,
+    "TRIANGLE": 1,
+    "SQUARE":   2,
 }
+_WAVEFORM_TYPE_SINE = _WAVEFORM_TYPE_MAP["SINE"]
+
+# 41-620 attenuator: 0 dB = full-scale output, per py620 readme's documented
+# 0-40 dB attenuation range. Full-scale output is 20 Vpp — used to convert a
+# target volts amplitude into the dB attenuation card.setAttenuation() wants.
+_FULL_SCALE_VOLTS = 20.0
+_ATTENUATION_DB_MIN = 0.0
+_ATTENUATION_DB_MAX = 40.0
+
+
+
+def _cardLabel(card):
+    """Best-effort human-readable label for a card, for logging.
+
+    pi620lx.Card has no CardId()/CardLoc() (unlike pilxi's Pi_Card_ByDevice).
+    initPXIE() stamps _bus/_device onto every card it opens (see below); this
+    just formats them, falling back gracefully if a card wasn't opened that
+    way (e.g. a mock in a test).
+    """
+    bus = getattr(card, "_bus", None)
+    device = getattr(card, "_device", None)
+    if bus is None or device is None:
+        return "<unknown card>"
+    return f"PXI{bus}::{device}"
+
 
 class waveAtributes:
-    """Stores all parameters that describe a single waveform channel output."""
+    """Stores all parameters that describe a single waveform channel output.
+
+    NOTE on units (pi620lx methodology, see test01 in this directory):
+      - frequency is stored in Hz (same as before) but is converted to kHz
+        by updateWaveform() before being passed to card.generateSignal(),
+        which expects kHz.
+      - amplitude is stored as dB of attenuation (card.setAttenuation()),
+        NOT a target voltage — pi620lx's simple/recommended workflow has no
+        direct "set amplitude in volts" call. Existing CSV configs written
+        for the old volts-based amplitude field will need their values
+        reinterpreted as dB.
+      - getAmplitudeVolts()/setAmplitudeVolts() convert to/from a target
+        output voltage, relative to the 41-620's documented full-scale
+        (_FULL_SCALE_VOLTS at 0 dB) and 0-40 dB attenuation range — use
+        these when a caller wants to think in volts instead of dB.
+      - offset is a voltage in the range -5 to 5V (card.setOutputOffsetVoltage()).
+      - symmetry (0-100) is new — pi620lx.Card.generateSignal() requires it
+        and the old pilxi PIFGLX_* calls had no equivalent. Defaults to 50.
+    """
 
     def __init__(self, channel, frequency, amplitude, offset, card=None, phase=0.0,
-                 waveform_type=pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE,
-                 activeTime=0.0, settlingTime=0.0):
+                 waveform_type=_WAVEFORM_TYPE_SINE,
+                 activeTime=0.0, settlingTime=0.0, symmetry=50.0):
         self._channel = channel
         self._card = card
         self._frequency = frequency
@@ -49,6 +93,7 @@ class waveAtributes:
         self._waveform_type = waveform_type
         self._activeTime = activeTime    # seconds the waveform is actively driven
         self._settlingTime = settlingTime  # seconds allowed for signal to settle
+        self._symmetry = symmetry
 
     # --- channel ---
     def getChannel(self):
@@ -64,12 +109,32 @@ class waveAtributes:
     def setFrequency(self, frequency):
         self._frequency = frequency
 
-    # --- amplitude ---
+    # --- amplitude (dB attenuation — see class docstring) ---
     def getAmplitude(self):
         return self._amplitude
 
     def setAmplitude(self, amplitude):
         self._amplitude = amplitude
+
+    # --- amplitude in volts (converted to/from dB attenuation) ---
+    def getAmplitudeVolts(self):
+        """Amplitude in volts, derived from the stored dB attenuation
+        relative to _FULL_SCALE_VOLTS (0 dB)."""
+        return _FULL_SCALE_VOLTS * (10 ** (-self._amplitude / 20.0))
+
+    def setAmplitudeVolts(self, volts):
+        """Set amplitude by target output volts.
+
+        Converted to dB attenuation relative to _FULL_SCALE_VOLTS and
+        clamped to the card's documented 0-40 dB attenuation range (0 dB =
+        full scale, 40 dB = max attenuation, i.e. quietest).
+        """
+        if volts <= 0:
+            db = _ATTENUATION_DB_MAX
+        else:
+            db = 20.0 * math.log10(_FULL_SCALE_VOLTS / volts)
+            db = max(_ATTENUATION_DB_MIN, min(_ATTENUATION_DB_MAX, db))
+        self._amplitude = db
 
     # --- offset ---
     def getOffset(self):
@@ -92,6 +157,13 @@ class waveAtributes:
     def setWaveformType(self, waveform_type):
         self._waveform_type = waveform_type
 
+    # --- symmetry ---
+    def getSymmetry(self):
+        return self._symmetry
+
+    def setSymmetry(self, symmetry):
+        self._symmetry = symmetry
+
     # --- activeTime ---
     def getActiveTime(self):
         return self._activeTime
@@ -110,7 +182,8 @@ class waveAtributes:
         return (f"waveAtributes(channel={self._channel}, frequency={self._frequency}, "
                 f"amplitude={self._amplitude}, offset={self._offset}, "
                 f"phase={self._phase}, waveform_type={self._waveform_type}, "
-                f"activeTime={self._activeTime}, settlingTime={self._settlingTime})")
+                f"symmetry={self._symmetry}, activeTime={self._activeTime}, "
+                f"settlingTime={self._settlingTime})")
 
 
 def readConfigs(configFilePath):
@@ -118,6 +191,8 @@ def readConfigs(configFilePath):
 
     Expected CSV columns (header row required):
         channel, frequency, amplitude, offset, phase, waveform_type, activeTime, settlingTime
+    Optional column:
+        symmetry (0-100) — defaults to 50 if the column is absent or blank.
 
     Returns a list of waveAtributes objects with card=None.
     Assign card handles after hardware is initialized.
@@ -127,7 +202,9 @@ def readConfigs(configFilePath):
         reader = csv.DictReader(f)
         for row in reader:
             wf_key = row["waveform_type"].strip().upper()
-            wf_type = _WAVEFORM_TYPE_MAP.get(wf_key, pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE)
+            wf_type = _WAVEFORM_TYPE_MAP.get(wf_key, _WAVEFORM_TYPE_SINE)
+            symmetry_raw = row.get("symmetry", "") if hasattr(row, "get") else ""
+            symmetry = float(symmetry_raw) if symmetry_raw not in (None, "") else 50.0
             wave = waveAtributes(
                 channel=int(row["channel"]),
                 frequency=float(row["frequency"]),
@@ -137,6 +214,7 @@ def readConfigs(configFilePath):
                 waveform_type=wf_type,
                 activeTime=float(row["activeTime"]),
                 settlingTime=float(row["settlingTime"]),
+                symmetry=symmetry,
             )
             waveforms.append(wave)
             log.info(f"Read waveform config: {wave}")
@@ -158,18 +236,26 @@ def readAllConfigs(configFilePaths):
 
 
 def initPXIE(ip_address="pxi", timeout=5000):
-    #Initalizes PXI interface and returns (session, list of waveAtributes).
-    # timeout (ms) is the TCP connect timeout — the default pilxi value (1000ms)
-    # is too short for a chassis that is still booting.
-    #
-    # NOTE: the returned session object MUST be kept alive by the caller for as
-    # long as the cards/waveforms are in use. Pi_Session.__del__ disconnects the
-    # LXI session, which invalidates every card opened from it — if the caller
-    # lets `session` go out of scope, Python garbage-collects it almost
-    # immediately (nothing else holds a Python reference to it; cards only keep
-    # the raw session handle, not the Pi_Session wrapper) and every card goes
-    # invalid ("Invalid session ID") a moment later.
+    """Initializes the PXI/LXI interface and returns (session, list of waveAtributes).
 
+    timeout (ms) is the TCP connect timeout — the default pilxi value (1000ms)
+    is too short for a chassis that is still booting.
+
+    Card discovery and control go through pi620lx (see test01 in this
+    directory), which is 41-620-specific: pi620lx.Base.findCards() only ever
+    returns 41-620 function generator cards, so — unlike the old
+    pilxi.Pi_Session.FindFreeCards() approach — there is no need to guess
+    whether a found card is actually a function generator, and no separate
+    "free vs claimed" concept exposed by this API to check.
+
+    NOTE: the returned session object MUST be kept alive by the caller for as
+    long as the cards/waveforms are in use. Pi_Session.__del__ disconnects the
+    LXI session, which invalidates every card opened from it — if the caller
+    lets `session` go out of scope, Python garbage-collects it almost
+    immediately (nothing else holds a Python reference to it; pi620lx cards
+    only keep the raw session ID, not the Pi_Session wrapper) and every card
+    goes invalid a moment later.
+    """
     session = pilxi.Pi_Session(ip_address, timeout=timeout)
 
     if session is None:
@@ -178,90 +264,36 @@ def initPXIE(ip_address="pxi", timeout=5000):
     else:
         log.info("PXI interface initialized successfully.")
 
-    # CountFreeCards() and FindFreeCards() both funnel driver errors through
-    # the same message decoder, so a failure from either looks identical from
-    # the caller's side. Call CountFreeCards() on its own first so the log
-    # says which one actually broke: if CountFreeCards() itself fails, the
-    # session is unusable and retrying the enumeration call won't help — hand
-    # back to the caller's reinit backoff. If it succeeds with 0, there's
-    # nothing to enumerate (cards may be claimed elsewhere, or the chassis
-    # hasn't finished booting) and calling FindFreeCards() is skipped entirely
-    # rather than risking whatever it does with a zero-count buffer.
     try:
-        freeCount = session.CountFreeCards()
+        sessionID = session.GetSessionID()
     except pilxi.Error as ex:
-        log.error(f"CountFreeCards() failed: {ex.message} — session is not usable right now.")
+        log.error(f"GetSessionID() failed: {ex.message} — session is not usable right now.")
         return session, []
 
-    if freeCount == 0:
-        log.warning("Chassis reports 0 free cards right now (cards may be claimed by another "
-                    "session/process, or the chassis is still enumerating after connect).")
-        freeCards = []
-    else:
-        freeCards = None
-        for attempt in (1, 2):
-            try:
-                freeCards = session.FindFreeCards() #Returns a list of tuples (bus, device) for each free card found.
-                break
-            except pilxi.Error as ex:
-                if attempt == 1:
-                    log.warning(f"FindFreeCards() failed despite CountFreeCards() reporting "
-                                f"{freeCount} free ({ex.message}) — retrying in 1s.")
-                    time.sleep(1.0)
-                else:
-                    log.error(f"FindFreeCards() failed again: {ex.message}")
-                    return session, []
+    pi620Base = pi620lx.Base(sessionID)
 
     try:
-        totalCards = session.GetTotalCardsCount()
-        if totalCards != len(freeCards):
-            log.warning(
-                f"Chassis reports {totalCards} total card(s) but only {len(freeCards)} "
-                f"are free — {totalCards - len(freeCards)} card(s) are claimed by another "
-                f"session/process and will NOT be opened here.")
-            # Identify what's actually holding them, rather than just guessing.
-            # A card claimed by a session that never disconnected cleanly (e.g.
-            # this same app force-killed mid-run on a previous attempt) shows up
-            # here and can be force-released without power-cycling the chassis.
-            try:
-                foreign = session.GetForeignSessions()
-                if foreign:
-                    log.warning(f"Other live session(s) on this LXI unit: {foreign} — one of "
-                                f"these likely holds the missing card(s). If this app was "
-                                f"previously force-killed rather than closed normally, this is "
-                                f"probably a leftover session from that run.")
-                else:
-                    log.warning("No other foreign sessions reported by the driver, yet cards "
-                                 "are still not free — check for another running instance of "
-                                 "this app, or a locked card that needs a chassis reboot to clear.")
-            except pilxi.Error as ex:
-                log.warning(f"Could not enumerate foreign sessions: {ex.message}")
-    except pilxi.Error as ex:
-        log.warning(f"Could not read total card count: {ex.message}")
+        cardLocs = pi620Base.findCards()  # [(bus, device), ...] — 41-620 cards only
+    except pi620lx.Error as ex:
+        log.error(f"findCards() failed: {ex.message}")
+        return session, []
+
+    if not cardLocs:
+        log.warning("No 41-620 function generator cards found on this LXI unit "
+                    "(cards may be claimed by another session/process, or the "
+                    "chassis is still enumerating after connect).")
 
     cards = []
-    for bus, device in freeCards: #Opens sessions with each free card and appends them to the cards list.
-        try: # NOTE: As long as the session with the LXI is open, the card will remain open.
-            card = session.OpenCard(bus, device) #Returns a Pi_Card_ByDevice object
-            card.ClearCard()
+    for bus, device in cardLocs:
+        try:
+            card = pi620Base.openCard(bus, device)
+            card._bus = bus
+            card._device = device
             cards.append(card)
-            try:
-                model = card.CardId()
-            except pilxi.Error as ex:
-                model = f"<CardId() failed: {ex.message}>"
-            if FG_CARD_ID_HINT not in model:
-                log.warning(
-                    f"Card at bus={bus} device={device} reports model '{model}', which does "
-                    f"NOT look like a {FG_CARD_ID_HINT!r} function-generator card. It will "
-                    f"still be treated as a 3-channel waveform generator and PIFGLX_* calls "
-                    f"will be sent to it — if those calls fail, this is very likely why: the "
-                    f"wrong card type is being commanded. Check what's physically in this "
-                    f"chassis slot and whether the real function generator card is present "
-                    f"but not free (see total-vs-free card count above).")
-            else:
-                log.info(f"Card at bus={bus} device={device}: {model}")
-        except pilxi.Error as ex:
-            log.error("Exception occurred: %s", ex.message)
+            log.info(f"Opened 41-620 card at bus={bus} device={device}")
+        except pi620lx.Error as ex:
+            log.error(f"Failed to open card at bus={bus} device={device}: {ex.message}")
+
     log.info(f"Found {len(cards)} valid cards.")
     cardWaves = buildWaveforms(cards)
     return session, cardWaves
@@ -271,154 +303,103 @@ def updateWaveform(card, wave: waveAtributes):
     if card is None:
         log.error("No card available.")
         return
-    channel   = wave.getChannel()
-    frequency = wave.getFrequency()
-    amplitude = wave.getAmplitude()
-    offset    = wave.getOffset()
-    phase     = wave.getPhase()
-    wf_type   = wave.getWaveformType()
+    channel       = wave.getChannel()
+    frequency_kHz = wave.getFrequency() / 1000.0
+    attenuation   = wave.getAmplitude()   # dB — see waveAtributes docstring
+    offset        = wave.getOffset()
+    phase         = wave.getPhase()
+    wf_type       = wave.getWaveformType()
+    symmetry      = wave.getSymmetry()
     try:
-        log.info(f"Updating waveform on card {card.CardId()}, channel {channel}: "
-                 f"frequency={frequency}, amplitude={amplitude}, offset={offset}, phase={phase}")
-        card.PIFGLX_AbortGeneration(channel)
-        card.PIFGLX_SetWaveform(channel, wf_type)
-        card.PIFGLX_SetAmplitude(channel, amplitude)
-        card.PIFGLX_SetFrequency(channel, frequency)
-        if offset < 0 or offset > 5:
-            log.warning("Offset voltage must be between 0 and 5 volts.")
-            card.PIFGLX_SetDcOffset(channel, 0)
+        log.info(f"Updating waveform on card {_cardLabel(card)}, channel {channel}: "
+                 f"frequency={frequency_kHz}kHz, attenuation={attenuation}dB, "
+                 f"offset={offset}, phase={phase}, symmetry={symmetry}")
+        card.setActiveChannel(channel)
+        card.outputOff()
+        card.setTriggerMode(card.triggerSources["FRONT"], card.triggerModes["CONT"])
+        if offset < -5 or offset > 5:
+            log.warning("Offset voltage must be between -5 and 5 volts.")
+            card.setOutputOffsetVoltage(0.0, True)
         else:
-            card.PIFGLX_SetDcOffset(channel, offset)
-        card.PIFGLX_SetStartPhase(channel, phase)
-        card.PIFGLX_InitiateGeneration(channel)
-    except pilxi.Error as error:
+            card.setOutputOffsetVoltage(offset, True)
+        card.setAttenuation(attenuation)
+        card.generateSignal(frequency_kHz, wf_type, symmetry,
+                             startPhaseOffset=phase, generate=False)
+        card.outputOn()
+    except pi620lx.Error as error:
         log.error("Exception occurred: %s", error.message)
 
 
-def readChannelStatus(card, channel):
-    """Read the generator's live setpoints and run state back from hardware.
+def abortGeneration(card, channel):
+    """Stop signal generation on one channel of a card.
 
-    Unlike the waveAtributes cache (which reflects the last commanded values
-    regardless of whether the write actually reached the card), this issues
-    PIFGLX_Get* calls directly against the card — useful for confirming
-    whether a set/InitiateGeneration call actually took effect.
-
-    Returns a dict with frequency, amplitude, offset, phase, waveform_type
-    (raw int), waveform_name (str), and generating (bool). Raises pilxi.Error
-    on failure — callers should catch and surface it rather than swallow it,
-    since the failure itself is diagnostic information.
+    pi620lx has no PIFGLX_AbortGeneration() equivalent — the closest is
+    selecting the channel and switching its output off.
     """
-    wf_type = card.PIFGLX_GetWaveform(channel)
-    wf_name = None
-    for name, value in _WAVEFORM_TYPE_MAP.items():
-        if value == wf_type:
-            wf_name = name
-            break
-    return {
-        "frequency": card.PIFGLX_GetFrequency(channel),
-        "amplitude": card.PIFGLX_GetAmplitude(channel),
-        "offset": card.PIFGLX_GetDcOffset(channel),
-        "phase": card.PIFGLX_GetStartPhase(channel),
-        "waveform_type": wf_type,
-        "waveform_name": wf_name or str(wf_type),
-        "generating": bool(card.PIFGLX_GetGenerationState(channel, 1)),
-    }
+    if card is None:
+        return
+    try:
+        card.setActiveChannel(channel)
+        card.outputOff()
+    except pi620lx.Error as error:
+        log.error("Exception occurred: %s", error.message)
 
 
 def waveformSelfCheck(cards):
     """
     Self-check routine for an array of 41-620 waveform generator card objects.
 
-    For each card:
-      1. Writes known arbitrary values to channel 1 via the PXI connection.
-      2. Reads those values back from the card.
-      3. Compares set vs. read with a small tolerance.
+    pi620lx has no PIFGLX_Get* read-back calls (unlike pilxi), so this can
+    only verify that the write path itself doesn't raise — it can no longer
+    read values back from hardware and compare, the way the old pilxi-based
+    version did. A card that silently ignores a bad write will still show
+    PASSED here.
+
+    For each card: writes known values to channel 1, and reports whether the
+    write raised an error.
 
     Prints a per-card result and a final summary.
     Returns a dict with keys "passed" and "failed", each a list of
-    (card_index, card_id) or (card_index, card_id, reason) tuples.
+    (card_index, card_label) or (card_index, card_label, reason) tuples.
     """
-    TEST_CHANNEL   = 1
-    TEST_FREQUENCY = 1000.0   # Hz
-    TEST_AMPLITUDE = 2.5      # Volts peak-to-peak
-    TEST_OFFSET    = 1.0      # Volts DC offset
-    TEST_PHASE     = 45.0     # Degrees
-    TOLERANCE      = 0.01     # Acceptable difference for float comparisons
+    TEST_CHANNEL     = 1
+    TEST_FREQUENCY   = 1000.0   # Hz (converted to kHz before being sent)
+    TEST_ATTENUATION = 3.0      # dB
+    TEST_OFFSET      = 1.0      # Volts DC offset
+    TEST_PHASE       = 45.0     # Degrees
+    TEST_SYMMETRY    = 50.0
 
-    log.info("=== Waveform Generator Self-Check ===")
+    log.info("=== Waveform Generator Self-Check (write-only — pi620lx has no read-back) ===")
 
     if not cards:
         log.info("No cards provided — nothing to check.")
         return {"passed": [], "failed": []}
 
     log.info(f"Cards received: {len(cards)}")
-    log.info(f"Waveform self-check started for {len(cards)} cards.")
 
     passed = []
     failed = []
 
     for i, card in enumerate(cards):
-        card_label = f"Card {i + 1}"
+        card_label = _cardLabel(card)
+        log.info(f"\n  Card {i + 1} [{card_label}]")
 
-        # Identify the card
         try:
-            card_id = card.CardId()
-        except pilxi.Error as ex:
-            log.error(f"\n  {card_label}: FAILED — could not read CardId ({ex.message})")
-            failed.append((i + 1, "Unknown", f"CardId read failed: {ex.message}"))
+            card.setActiveChannel(TEST_CHANNEL)
+            card.outputOff()
+            card.setTriggerMode(card.triggerSources["FRONT"], card.triggerModes["CONT"])
+            card.setOutputOffsetVoltage(TEST_OFFSET, True)
+            card.setAttenuation(TEST_ATTENUATION)
+            card.generateSignal(TEST_FREQUENCY / 1000.0, _WAVEFORM_TYPE_SINE, TEST_SYMMETRY,
+                                 startPhaseOffset=TEST_PHASE, generate=False)
+            card.outputOn()
+        except pi620lx.Error as ex:
+            log.error(f"    FAILED — write raised an error ({ex.message})")
+            failed.append((i + 1, card_label, f"Write failed: {ex.message}"))
             continue
 
-        log.info(f"\n  {card_label} [{card_id}]")
-
-        # --- Write test values ---
-        try:
-            card.PIFGLX_AbortGeneration(TEST_CHANNEL)
-            card.PIFGLX_SetWaveform(TEST_CHANNEL, pilxi.WaveformTypes.PIFGLX_WAVEFORM_SINE)
-            card.PIFGLX_SetFrequency(TEST_CHANNEL, TEST_FREQUENCY)
-            card.PIFGLX_SetAmplitude(TEST_CHANNEL, TEST_AMPLITUDE)
-            card.PIFGLX_SetDcOffset(TEST_CHANNEL, TEST_OFFSET)
-            card.PIFGLX_SetStartPhase(TEST_CHANNEL, TEST_PHASE)
-            card.PIFGLX_InitiateGeneration(TEST_CHANNEL)
-        except pilxi.Error as ex:
-            log.error(f"    FAILED — could not write test values ({ex.message})")
-            failed.append((i + 1, card_id, f"Write failed: {ex.message}"))
-            continue
-
-        # --- Read values back ---
-        try:
-            read_freq   = card.PIFGLX_GetFrequency(TEST_CHANNEL)
-            read_amp    = card.PIFGLX_GetAmplitude(TEST_CHANNEL)
-            read_offset = card.PIFGLX_GetDcOffset(TEST_CHANNEL)
-            read_phase  = card.PIFGLX_GetStartPhase(TEST_CHANNEL)
-        except pilxi.Error as ex:
-            log.error(f"    FAILED — could not read back values ({ex.message})")
-            failed.append((i + 1, card_id, f"Read failed: {ex.message}"))
-            continue
-
-        log.info(f"    {'Attribute':<12} {'Set':>10}  {'Read':>10}  {'Match':>6}")
-        log.info(f"    {'-'*44}")
-
-        mismatches = []
-        checks = [
-            ("Frequency",  TEST_FREQUENCY, read_freq,   "Hz"),
-            ("Amplitude",  TEST_AMPLITUDE, read_amp,    "V"),
-            ("DC Offset",  TEST_OFFSET,    read_offset, "V"),
-            ("Phase",      TEST_PHASE,     read_phase,  "deg"),
-        ]
-        for name, expected, actual, unit in checks:
-            ok = abs(actual - expected) <= TOLERANCE
-            status = "OK" if ok else "FAIL"
-            log.info(f"    {name:<12} {expected:>9.3f}  {actual:>9.3f}  {status:>6}  {unit}")
-            if not ok:
-                mismatches.append(f"{name}: expected {expected} {unit}, got {actual} {unit}")
-
-        if mismatches:
-            reason = "; ".join(mismatches)
-            log.error(f"    Result: FAILED ({len(mismatches)} mismatch(es))")
-            failed.append((i + 1, card_id, reason))
-        else:
-            log.info(f"    Result: PASSED")
-            passed.append((i + 1, card_id))
+        log.info(f"    Result: PASSED (write completed without error)")
+        passed.append((i + 1, card_label))
 
     # --- Summary ---
     log.info(f"\n=== Summary ===")
@@ -445,7 +426,7 @@ def buildWaveforms(cardArray):
     Builds a list of 6 waveAtributes objects, 3 per card.
 
     """
-    
+
     log.info(f"Building waveforms for {len(cardArray)} cards.")
     waveforms = []
     for card in cardArray:
@@ -453,4 +434,3 @@ def buildWaveforms(cardArray):
             wave = waveAtributes(channel=channel, card=card, frequency=0, amplitude=0, offset=0)
             waveforms.append(wave)
     return waveforms
-

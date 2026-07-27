@@ -274,7 +274,7 @@ def pxi_ThreadManager():
         with pxiLock:
             for j, wave in enumerate(config):
                 try:
-                    pxiWaves[j]._card.PIFGLX_AbortGeneration(wave.getChannel())
+                    PI.abortGeneration(pxiWaves[j]._card, wave.getChannel())
                 except Exception as e:
                     logMsg("ERROR", f"{name} config {i+1} AbortGeneration[{j}] failed: {e}")
 
@@ -392,11 +392,12 @@ def restartThread(name):
 # PXI hardware health
 # ===========================================================================
 def checkPXIHealth():
-    """Ping every open card by reading its CardId. Returns True if all respond.
+    """Ping every open card by querying its revision. Returns True if all respond.
 
-    CardId() is a lightweight read over the PXI bus. A pilpxi.Error or any
-    other exception means that card (or the whole cabinet) is not responding.
-    Called from the watchdog — always holds pxiLock before entering.
+    pi620lx.Card has no CardId() (unlike pilxi's Pi_Card_ByDevice) — uses
+    revisionQuery() instead, a lightweight read over the PXI bus. A pi620lx.Error
+    or any other exception means that card (or the whole cabinet) is not
+    responding. Called from the watchdog — always holds pxiLock before entering.
     """
     if not pxiWaves:
         logMsg("WARNING", "PXI health check: no waves registered")
@@ -408,7 +409,7 @@ def checkPXIHealth():
             continue
         seen.add(id(card))
         try:
-            card.CardId()
+            card.revisionQuery()
         except Exception as e:
             logMsg("ERROR", f"PXI health check: card {i // 3} not responding ({e})")
             return False
@@ -442,7 +443,7 @@ def reinitPXI():
             if id(card) not in seen:
                 seen.add(id(card))
                 try:
-                    card.Close()
+                    card.close()
                 except Exception:
                     pass
         pxiWaves.clear()
@@ -549,7 +550,7 @@ def triggerSafeMode():
 
     # All PXI / function generator outputs zeroed.
     try:
-        # TODO: for wave in pxiWaves: wave._card.PIFGLX_AbortGeneration(wave.getChannel())
+        # TODO: for wave in pxiWaves: PI.abortGeneration(wave._card, wave.getChannel())
         logMsg("INFO", "Safe mode: PXI outputs zeroed")
     except Exception as e:
         logMsg("ERROR", f"Safe mode PXI shutdown failed: {e}")
