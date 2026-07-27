@@ -3,9 +3,9 @@ import pickeringInterface as pI
 session, waves = pI.initPXIE()
 
 channel = 1
-frequency = 255000  # hz
-amplitude = 1.0  # volts
-offset = 0.0  # volts
+frequency = 255000  # hz (converted to kHz internally by updateWaveform())
+amplitude = 1.0  # dB attenuation (card.setAttenuation()) — NOT volts, see pickeringInterface.waveAtributes
+offset = 0.0  # volts, -5 to 5
 phase = 0.0  # degrees
 
 # waves is indexed: card_index * 3 + (channel - 1)

@@ -181,6 +181,41 @@ use. The theory doesn't apply here. (Worth confirming the actual model off
 the chassis label/front LCD if it becomes relevant again — the manual on
 file in this repo does not match the physical hardware.)
 
+## 7. Update 2026-07-17 (evening): pi620lx migration + escalation to session-level refusal
+
+`pickeringInterface.py` was rewritten this same day to use `pi620lx` instead
+of pilxi's `PIFGLX_*` calls, per a sample script (`pickeringControls/test01`)
+Pickering support sent after confirming `PIFGLX_*` doesn't work with these
+41-620 cards. See `pickeringREADME.md` for the full contract change. This
+rewrite did **not** touch the LXI session-open call — `initPXIE()` still
+opens the session via `pilxi.Pi_Session(ip_address, timeout=timeout)` exactly
+as before, and pi620lx is only reached after that call succeeds.
+
+**New symptom, same evening:** `groundController.py` failed to connect from
+its very first attempt (`PXI init failed: Client: Connect failed.`) and then
+failed on every reinit retry for 5+ minutes straight, including after the
+operator manually changed the IP (to the same value) via LXI Manager. Ran
+`test01.py` standalone in a separate terminal (without closing
+`groundController.py` first) to check whether the chassis was refusing
+`groundController.py` specifically — **`test01.py` also failed with the same
+`pilxi.Error: Client: Connect failed.`**, despite it having connected
+successfully earlier in the day.
+
+**This rules out a code-level cause** (in either the old or new
+`pickeringInterface.py` — the session-open call is unchanged) **and confirms
+the chassis is refusing connections from every client**, not just this app.
+This is a worse version of the section 5 symptom (there, the session opened
+fine but cards were claimed; here, no session opens at all) and fits the same
+leading theory: a claim/lock stuck at the chassis/firmware level, invisible
+to and unclearable by any client-side session logic. Plausibly made worse by
+`groundController.py`'s reinit loop retrying the connect every 5-60s for
+several minutes straight against an already-wedged chassis.
+
+**Next action: full chassis power cycle** (rear power switch, full off/on —
+not just restarting the Python process/app), same as the unactioned
+recommendation from section 5/6 below. Re-test with `test01.py` first (lower
+blast radius, no reinit loop) before restarting `groundController.py`.
+
 ### Next steps (unresolved as of this writing)
 
 Both the orphaned-session theory (section 5) and the USB-override theory

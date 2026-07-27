@@ -23,7 +23,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(_HERE, "spacecraftSerial"))
 
-from pickeringControls.pickeringInterface import initPXIE, updateWaveform, waveAtributes, readChannelStatus
+from pickeringControls.pickeringInterface import initPXIE, updateWaveform, waveAtributes, abortGeneration
 from relayControls.relaySerial import RelayController
 import serial
 
@@ -61,15 +61,20 @@ TRANSDUCER_PAIR = [2, 3, 4, 0, 1, 5, 5, 1, 0, 4, 3, 2]
 # (key, label, hard_min, hard_max, default, slider_min, slider_max, fmt_spec)
 PARAMS = [
     ("freq",   "Freq (Hz)",  100.0, 1_000_000.0, 40_000.0, 1_000.0, 200_000.0, ".0f"),
-    ("amp",    "Amp (V)",      0.0,         5.0,      1.0,     0.0,       5.0,  ".3f"),
+    # "Amp" is entered in volts and converted to dB attenuation via
+    # waveAtributes.setAmplitudeVolts() (card.setAttenuation() itself only
+    # takes dB) — range is 0-20V, the 41-620's full-scale output.
+    ("amp",    "Amp (V)",      0.0,        20.0,     10.0,     0.0,      20.0,  ".3f"),
     ("offset", "Offset (V)",   0.0,         5.0,      0.0,     0.0,       5.0,  ".3f"),
     ("phase",  "Phase (°)",    0.0,       360.0,      0.0,     0.0,     360.0,  ".1f"),
 ]
 
+
+# Matches pi620lx.Base/Card.signalShapes (SINE=0, TRIANGLE=1, SQUARE=2) — note
+# TRIANGLE/SQUARE are swapped relative to the old pilxi.WaveformTypes enum.
+# RAMP/DC/PULSE/PWM/ARB have no pi620lx equivalent and are no longer supported.
 WAVEFORM_NAMES = {
-    0: "SINE", 1: "SQUARE", 2: "TRIANGLE",
-    3: "RAMP_UP", 4: "RAMP_DOWN", 5: "DC",
-    6: "PULSE", 7: "PWM", 8: "ARB",
+    0: "SINE", 1: "TRIANGLE", 2: "SQUARE",
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -259,7 +264,7 @@ def pxi_worker():
                 if wave_idx < len(pxiWaves):
                     wave = pxiWaves[wave_idx]
                     wave.setFrequency(freq)
-                    wave.setAmplitude(amp)
+                    wave.setAmplitudeVolts(amp)
                     wave.setOffset(offset)
                     wave.setPhase(phase)
                     try:
@@ -292,7 +297,7 @@ def pxi_worker():
             with pxiLock:
                 for wave in pxiWaves:
                     try:
-                        wave._card.PIFGLX_AbortGeneration(wave.getChannel())
+                        abortGeneration(wave._card, wave.getChannel())
                     except Exception:
                         pass
             for p in range(NUM_PAIRS):
@@ -306,7 +311,7 @@ def pxi_worker():
                         wf_name = "SINE"
                     stateBus._notify("channel_update", {
                         "pair": p,
-                        "freq": w.getFrequency(), "amp": w.getAmplitude(),
+                        "freq": w.getFrequency(), "amp": w.getAmplitudeVolts(),
                         "offset": w.getOffset(), "phase": w.getPhase(),
                         "waveform": wf_name, "generating": False,
                     })
@@ -473,7 +478,12 @@ def restartThread(name):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def checkPXIHealth():
-    """Ping every open card. Returns True if all respond."""
+    """Ping every open card. Returns True if all respond.
+
+    pi620lx.Card has no CardId() (unlike pilxi's Pi_Card_ByDevice) — uses
+    revisionQuery() instead, a lightweight read over the PXI bus that still
+    requires a live round-trip to the card.
+    """
     if not pxiWaves:
         return False
     seen = set()
@@ -483,13 +493,12 @@ def checkPXIHealth():
             continue
         seen.add(id(card))
         try:
-            card.CardId()
+            card.revisionQuery()
         except Exception as e:
             logMsg("ERROR", f"PXI health: card {i // 3} not responding ({e})")
             _lxi_append_error(f"health check card {i // 3}: {e}")
             return False
     return True
-
 
 def reinitPXI(force=False):
     """Close all card handles and re-run initPXIE() under pxiLock.
@@ -516,7 +525,7 @@ def reinitPXI(force=False):
             if id(card) not in seen:
                 seen.add(id(card))
                 try:
-                    card.Close()
+                    card.close()
                 except Exception:
                     pass
         pxiWaves.clear()
@@ -605,7 +614,7 @@ def saveGroundConfig(name, gui_values=None):
                 except Exception:
                     wf_name = "SINE"
                 rows.append([
-                    ch_num, wave.getFrequency(), wave.getAmplitude(),
+                    ch_num, wave.getFrequency(), wave.getAmplitudeVolts(),
                     wave.getOffset(), wave.getPhase(), wf_name,
                 ])
             elif gui_values is not None and pair_idx < len(gui_values):
@@ -675,8 +684,9 @@ def watchdog_worker():
             with pxiLock:
                 healthy = checkPXIHealth()
             if not healthy:
-                logMsg("ERROR", "PXI health check failed — reinitialising connection")
-                reinitPXI()
+                logMsg("ERROR",
+                    "PXI health check failed — reinit is operator-triggered only "
+                    "(use LXI Manager's Reinit button)")
 
         updateHeartbeat(name)
         time.sleep(WATCHDOG_INTERVAL)
@@ -705,7 +715,7 @@ def triggerSafeMode():
         with pxiLock:
             for wave in pxiWaves:
                 try:
-                    wave._card.PIFGLX_AbortGeneration(wave.getChannel())
+                    abortGeneration(wave._card, wave.getChannel())
                 except Exception:
                     pass
         logMsg("INFO", "Safe mode: PXI outputs zeroed")
@@ -1023,7 +1033,6 @@ class LXIManagerWindow(tk.Toplevel):
 
         self._error_shown_count = 0   # how many lxiErrors entries are in the log box
         self._card_rows: list[list[tk.Label]] = []
-        self._channel_rows: list[list[tk.Label]] = []
 
         self._build_ui()
         self._refresh()
@@ -1073,8 +1082,8 @@ class LXIManagerWindow(tk.Toplevel):
                                    padx=8, pady=6)
         card_frame.pack(fill="x", padx=10, pady=4)
 
-        headers = ["#", "Model", "Bus", "Slot", "Ch 1", "Ch 2", "Ch 3", "Last Check"]
-        widths  = [3,   10,      5,     5,      6,      6,      6,      12]
+        headers = ["#", "Model", "Bus", "Slot", "Last Check"]
+        widths  = [3,   10,      5,     5,      12]
         for col, (h, w) in enumerate(zip(headers, widths)):
             tk.Label(card_frame, text=h, bg=BG, fg=FG_DIM,
                      font=("Helvetica", 8, "bold"), width=w,
@@ -1086,32 +1095,13 @@ class LXIManagerWindow(tk.Toplevel):
                                       bg=BG, fg=FG_DIM, font=("Italic", 8))
         self._no_cards_lbl.grid(row=1, column=0, columnspan=len(headers),
                                  sticky="w", padx=4, pady=2)
-
-        # ── Section B2: Live Generator Status (read directly from hardware) ───
-        chan_frame = tk.LabelFrame(self, text="Generator Status (live hardware read-back)",
-                                   bg=BG, fg=FG, font=("Helvetica", 9, "bold"),
-                                   padx=8, pady=6)
-        chan_frame.pack(fill="x", padx=10, pady=4)
-
-        chan_headers = ["Card", "Ch", "Cmd Freq", "Live Freq", "Live Amp", "Waveform", "State"]
-        chan_widths  = [5,      3,    9,           9,           8,          9,          6]
-        for col, (h, w) in enumerate(zip(chan_headers, chan_widths)):
-            tk.Label(chan_frame, text=h, bg=BG, fg=FG_DIM,
-                     font=("Helvetica", 8, "bold"), width=w,
-                     anchor="w").grid(row=0, column=col, padx=3, pady=(0, 2))
-
-        self._channel_grid_frame = chan_frame
-        self._channel_grid_widths = chan_widths
-        self._no_channels_lbl = tk.Label(chan_frame, text="No channels detected.",
-                                         bg=BG, fg=FG_DIM, font=("Italic", 8))
-        self._no_channels_lbl.grid(row=1, column=0, columnspan=len(chan_headers),
-                                    sticky="w", padx=4, pady=2)
-        tk.Label(chan_frame,
-                 text="\"Cmd\" is the last value the software wrote; \"Live\" is read back "
-                      "directly from the card. A mismatch means the write didn't reach the card.",
+        tk.Label(card_frame,
+                 text="Live per-channel read-back is not available with the pi620lx "
+                      "interface (no PIFGLX_Get*-equivalent calls) — this table shows "
+                      "card identity only, not live signal state.",
                  bg=BG, fg=FG_DIM, font=("Helvetica", 7, "italic"),
                  wraplength=520, justify="left").grid(
-            row=2, column=0, columnspan=len(chan_headers), sticky="w", padx=4, pady=(4, 0))
+            row=2, column=0, columnspan=len(headers), sticky="w", padx=4, pady=(4, 0))
 
         # ── Section C: Error Log ──────────────────────────────────────────────
         err_frame = tk.LabelFrame(self, text="Error Log",
@@ -1195,7 +1185,7 @@ class LXIManagerWindow(tk.Toplevel):
         if self.focus_get() is not self._ip_entry:
             self._ip_var.set(PXI_IP)
 
-        # Card table — rebuild in background to avoid blocking on CardId()
+        # Card table — rebuild in background to avoid blocking on the PXI bus
         threading.Thread(target=self._fetch_card_info, daemon=True).start()
 
         # Error log — append only new entries
@@ -1211,77 +1201,35 @@ class LXIManagerWindow(tk.Toplevel):
         self.after(2000, self._refresh)
 
     def _fetch_card_info(self):
-        """Gather CardId/CardLoc and live per-channel generator status from
-        hardware (runs in background thread). The channel reads use
-        readChannelStatus(), which issues PIFGLX_Get* calls straight to the
-        card — this is what lets the Generator Status table show whether a
-        commanded value actually reached the hardware, as opposed to the main
-        window's per-pair display, which only echoes the last commanded value.
+        """Gather card bus/device identity (runs in background thread).
+
+        pi620lx.Card has no CardId()/CardLoc() (unlike pilxi's
+        Pi_Card_ByDevice) and no PIFGLX_Get* read-back, so this can no longer
+        show a live per-channel generator status table — only the bus/device
+        location initPXIE() stamped onto each card (card._bus/_device) plus a
+        static model label, since pi620lx.Base.findCards() only ever returns
+        41-620 cards by construction. The main window's per-pair display
+        still echoes the last commanded value only.
         """
         rows = []
-        channel_rows = []
         with pxiLock:
             seen_ids = {}
-            card_ch_state = {}   # card idx -> {channel: "RUN"/"IDLE"/"ERR"}
             for wave in pxiWaves:
                 card = wave._card
                 cid = id(card)
                 if cid not in seen_ids:
                     seen_ids[cid] = len(seen_ids)
-                    try:
-                        model = card.CardId()
-                    except Exception as e:
-                        model = f"Error: {e}"
-                        _lxi_append_error(f"card {seen_ids[cid]} CardId() failed: {e!r}")
-                        logMsg("ERROR", f"LXI card {seen_ids[cid]} CardId() failed: {e!r}")
-                    try:
-                        bus, slot = card.CardLoc()
-                    except Exception as e:
-                        bus, slot = "?", "?"
-                        _lxi_append_error(f"card {seen_ids[cid]} CardLoc() failed: {e!r}")
-                        logMsg("ERROR", f"LXI card {seen_ids[cid]} CardLoc() failed: {e!r}")
+                    bus = getattr(card, "_bus", "?")
+                    device = getattr(card, "_device", "?")
                     rows.append({
-                        "idx":   seen_ids[cid],
-                        "model": model,
-                        "bus":   str(bus),
-                        "slot":  str(slot),
-                        "ts":    time.strftime("%H:%M:%S"),
+                        "idx":    seen_ids[cid],
+                        "model":  "41-620 FG",
+                        "bus":    str(bus),
+                        "slot":   str(device),
+                        "ts":     time.strftime("%H:%M:%S"),
                     })
-                    card_ch_state[seen_ids[cid]] = {}
-
-                card_idx = seen_ids[cid]
-                channel = wave.getChannel()
-                try:
-                    live = readChannelStatus(card, channel)
-                    card_ch_state[card_idx][channel] = "RUN" if live["generating"] else "IDLE"
-                    channel_rows.append({
-                        "card": card_idx, "ch": channel,
-                        "cmd_freq": wave.getFrequency(),
-                        "live_freq": live["frequency"],
-                        "live_amp": live["amplitude"],
-                        "waveform": live["waveform_name"],
-                        "generating": live["generating"],
-                        "ok": True,
-                    })
-                except Exception as e:
-                    card_ch_state[card_idx][channel] = "ERR"
-                    channel_rows.append({
-                        "card": card_idx, "ch": channel,
-                        "cmd_freq": wave.getFrequency(),
-                        "live_freq": None, "live_amp": None,
-                        "waveform": f"Error: {e}",
-                        "generating": False,
-                        "ok": False,
-                    })
-                    _lxi_append_error(f"card {card_idx} ch{channel} status read failed: {e!r}")
-                    logMsg("ERROR", f"LXI card {card_idx} ch{channel} status read failed: {e!r}")
-
-            for row in rows:
-                states = card_ch_state.get(row["idx"], {})
-                row["ch_states"] = [states.get(ch, "?") for ch in (1, 2, 3)]
 
         self.after(0, self._update_card_table, rows)
-        self.after(0, self._update_channel_table, channel_rows)
 
     def _update_card_table(self, rows: list):
         if not self.winfo_exists():
@@ -1299,19 +1247,15 @@ class LXIManagerWindow(tk.Toplevel):
 
         self._no_cards_lbl.grid_remove()
         widths = self._card_grid_widths
-        ch_state_color = {"RUN": GREEN, "IDLE": FG_DIM, "ERR": RED, "?": FG_DIM}
         for r, info in enumerate(rows):
             cols_data = [
                 str(info["idx"]),
                 info["model"],
                 info["bus"],
                 info["slot"],
-                *info["ch_states"],
                 info["ts"],
             ]
-            col_colors = [FG, FG, FG, FG,
-                          *(ch_state_color.get(s, FG_DIM) for s in info["ch_states"]),
-                          FG]
+            col_colors = [FG, FG, FG, FG, FG]
             row_labels = []
             for c, (val, w, fg) in enumerate(zip(cols_data, widths, col_colors)):
                 lbl = tk.Label(self._card_grid_frame, text=val,
@@ -1320,48 +1264,6 @@ class LXIManagerWindow(tk.Toplevel):
                 lbl.grid(row=r + 1, column=c, padx=3, pady=1)
                 row_labels.append(lbl)
             self._card_rows.append(row_labels)
-
-    def _update_channel_table(self, rows: list):
-        if not self.winfo_exists():
-            return
-
-        for row_labels in self._channel_rows:
-            for lbl in row_labels:
-                lbl.destroy()
-        self._channel_rows.clear()
-
-        if not rows:
-            self._no_channels_lbl.grid()
-            return
-
-        self._no_channels_lbl.grid_remove()
-        widths = self._channel_grid_widths
-        FREQ_TOLERANCE_HZ = 1.0
-        for r, info in enumerate(rows):
-            if not info["ok"]:
-                cols_data = [str(info["card"]), str(info["ch"]),
-                             f"{info['cmd_freq']:.0f}", "?", "?",
-                             info["waveform"], "ERR"]
-                col_colors = [FG, FG, FG, RED, RED, RED, RED]
-            else:
-                mismatch = abs(info["cmd_freq"] - info["live_freq"]) > FREQ_TOLERANCE_HZ
-                freq_color = RED if mismatch else FG
-                cols_data = [
-                    str(info["card"]), str(info["ch"]),
-                    f"{info['cmd_freq']:.0f}", f"{info['live_freq']:.0f}",
-                    f"{info['live_amp']:.3f}", info["waveform"],
-                    "RUN" if info["generating"] else "IDLE",
-                ]
-                col_colors = [FG, FG, freq_color, freq_color, FG, FG,
-                              GREEN if info["generating"] else FG_DIM]
-            row_labels = []
-            for c, (val, w, fg) in enumerate(zip(cols_data, widths, col_colors)):
-                lbl = tk.Label(self._channel_grid_frame, text=val,
-                               bg=BG, fg=fg, font=("Courier", 8),
-                               width=w, anchor="w")
-                lbl.grid(row=r + 1, column=c, padx=3, pady=1)
-                row_labels.append(lbl)
-            self._channel_rows.append(row_labels)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
