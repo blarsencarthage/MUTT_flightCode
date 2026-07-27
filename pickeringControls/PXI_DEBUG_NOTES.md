@@ -238,6 +238,93 @@ Both the orphaned-session theory (section 5) and the USB-override theory
    `python.exe`/`pythonw.exe` — unlikely to be the cause given
    `GetForeignSessions()` now reports empty, but costs nothing to rule out.
 
+## 8. Update 2026-07-27: recurrence after the v2/pickeringHeader rewrite, + a real revisionQuery() vendor bug
+
+`groundController.py` was rewritten this week to use `pickeringInterfaceV2.py`'s
+`pickeringHeader` class instead of `pickeringInterface.py`'s free functions
+(see `pickeringControls/pickeringInterfaceV2_README.md`). Two issues showed
+up in the first real session against hardware, logged in
+`groundLog/ground_2026-07-27_11-10-58.log`:
+
+**8a. `checkPXIHealth()` always reported "not responding" — false positive, not hardware.**
+`Card.revisionQuery()` in `pilxi-5.7/pi620lx/__init__.py` (~line 316) returns
+`self._pythonString(driverRev)` / `self._pythonString(instrumentRev)` —
+missing `.value` on the `ctypes.create_string_buffer` objects, unlike every
+other method in that file (compare `errorMessage()` immediately above it,
+which correctly does `.value` first). `_pythonString()` calls `.decode()` on
+whatever it's handed; a raw `ctypes.Array` has no `.decode()`, so this always
+raises `'c_char_Array_100' object has no attribute 'decode'` — even when the
+card responded correctly. `checkPXIHealth()` had been wired to call
+`revisionQuery()` as a live ping, so it showed the health check failing
+continuously regardless of actual card state, while the LXI Manager's
+`connectionStatus`-based "CONNECTED" indicator stayed green — an apparent
+contradiction that was really just "one status is fake."
+
+**Decision:** left the vendor file (`pilxi-5.7/`) unpatched, per standing
+policy of treating vendor-supplied wrappers as third-party/hands-off (see
+root `CLAUDE.md`). Instead, `checkPXIHealth()` in `groundController.py` was
+changed to stop calling `revisionQuery()` entirely — it now only reports
+`pxiHeader.connectionStatus` + cards-found, i.e. no live round-trip ping at
+all. This means a chassis that goes unresponsive without `pxiHeader`
+noticing (see 8b) won't be caught by the periodic health check anymore
+either — a real gap, not just a cosmetic one. If a live ping is wanted
+later, `revisionQuery()` needs the vendor `.value` fix first, or a different
+pi620lx call needs to be found/verified not to share the same bug.
+
+**8b. Real send/arm failures after a ~22-minute `pxi_worker` thread hang — same "cards found but commands fail" pattern as sections 5-7.**
+Timeline from the log:
+```
+11:12:11  last normal activity (health checks/apply working)
+11:34:47  PXI heartbeat stale (1353.2s) — watchdog restarts the PXI thread
+11:34:53  PXI health: card 0 not responding ()      <- empty message, a real driver error code this time
+11:36:22  Failed to send config to card PXI4::15 channel 1: (empty message)
+11:36:40  Failed to arm card PXI4::15 channel 1: (empty message)
+```
+`pxi_worker()` calls `updateHeartbeat()` every `WORKER_TIMEOUT` (0.2s) on
+every loop iteration, so a 1353s stale heartbeat means something inside a
+`pxiHeader` call (`sendConfigToCards()`/`armFuncGens()`/etc., down inside the
+pilxi/pi620lx C driver) genuinely blocked for ~22 minutes — there is no
+per-call timeout on individual card commands, only on the initial
+`Pi_Session` connect. After it finally returned/gave up, subsequent card
+writes started failing outright with real (but textless — the driver has no
+description string for whatever code this is) error codes.
+
+A fresh, completely independent diagnostic script run minutes later
+(separate process, new `pilxi.Pi_Session` + `pi620lx.Base`, same IP)
+connected and successfully called `setActiveChannel()` on both cards
+immediately — so the chassis was not dead, and the two real 41-620s were not
+permanently wedged this time (unlike sections 5-7's fully-stuck state). But
+something about the *existing* long-lived session inside `groundController.py`
+went bad mid-run and didn't recover on its own.
+
+**This is the same "found/connected but writes fail" symptom family as
+sections 5-7**, just triggered differently (a mid-session hang+failure rather
+than never-free-at-connect-time). The section 5-7 leading theory (a stuck
+claim/state at the chassis/firmware level that only clears on a full power
+cycle) is the working assumption here too, though not confirmed this time —
+the app was closed (not power-cycled) before the next successful connection
+attempt (my standalone diagnostic script), so it's not proven that a power
+cycle specifically was required to unstick it this time, only that closing
+and reopening the *session* was sufficient. Worth testing next time: try
+"Apply & Reinit" from the LXI Manager (new session, no power cycle) before
+escalating to a physical power cycle, to narrow down which level (session vs
+chassis firmware) actually needs the reset.
+
+**Not fixed/still open:**
+- No root cause for *why* a `pxiHeader` call hangs ~22 minutes then starts
+  failing — only a recurrence pattern, matching sections 5-7.
+- No per-call timeout exists on pilxi/pi620lx card commands, so a chassis
+  going bad mid-session will hang the `PXI` worker thread (and block
+  anything else waiting on `pxiLock`) for however long the driver takes to
+  give up, with no way to abort it from Python short of killing the thread's
+  process. `groundController.py`'s watchdog only detects this after the
+  fact (heartbeat staleness) and restarts the worker thread, which does not
+  reopen `pxiHeader`'s connection — reopening still requires the operator to
+  hit "Apply & Reinit" manually.
+- `revisionQuery()`'s missing `.value` bug is unfixed in `pilxi-5.7/`
+  (deliberately, see decision above) — don't reintroduce a live health-check
+  ping through it without fixing that first.
+
 ## Files touched this session
 
 - `pickeringControls/pickeringInterface.py` — session lifetime fix,
@@ -254,3 +341,12 @@ Both the orphaned-session theory (section 5) and the USB-override theory
   live Generator Status table in `LXIManagerWindow`.
 - `flightCode/flightController.py` — same session-lifetime fix as
   `groundController.py` (shared `initPXIE()`).
+
+### Files touched 2026-07-27 (section 8)
+
+- `groundController.py` — `checkPXIHealth()` no longer calls
+  `card.revisionQuery()`; now reports `pxiHeader.connectionStatus`/cards-found
+  only, no live ping.
+- `pickeringControls/pilxi-5.7/pi620lx/__init__.py` — **not** touched;
+  `revisionQuery()`'s missing-`.value` bug (section 8a) was deliberately left
+  in place per vendor-code-hands-off policy.

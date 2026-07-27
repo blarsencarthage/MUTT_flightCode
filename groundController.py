@@ -545,22 +545,21 @@ def restartThread(name):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def checkPXIHealth():
-    """Ping every open card. Returns True if connected and all respond.
+    """Returns True if pxiHeader reports a connected session with cards found.
 
-    pi620lx.Card has no CardId() (unlike pilxi's Pi_Card_ByDevice) — uses
-    revisionQuery() instead, a lightweight read over the PXI bus that still
-    requires a live round-trip to the card.
+    NOTE: this is NOT a live round-trip ping. pi620lx.Card.revisionQuery()
+    would be the natural candidate for one, but the vendor's pilxi-5.7/
+    pi620lx/__init__.py has a bug (returns the raw ctypes buffer instead of
+    .value, so _pythonString()'s .decode() always throws) that makes it
+    always report failure regardless of actual card state — see the
+    revisionQuery() docstring/TODO in that file before ever calling it here
+    again. So this only reflects pxiHeader.connectionStatus (set once at
+    connect time, cleared only if _monitorLXI's own reconnect logic fires) —
+    a hung/unresponsive chassis that never raises won't be caught by this
+    check. Real hardware errors will still surface individually through
+    sendConfigToCards()/armFuncGens()/etc. in pxi_worker.
     """
-    if pxiHeader is None or not pxiHeader.connectionStatus or not pxiHeader.cards:
-        return False
-    for i, card in enumerate(pxiHeader.cards):
-        try:
-            card.revisionQuery()
-        except Exception as e:
-            logMsg("ERROR", f"PXI health: card {i} not responding ({e})")
-            _lxi_append_error(f"health check card {i}: {e}")
-            return False
-    return True
+    return pxiHeader is not None and pxiHeader.connectionStatus and bool(pxiHeader.cards)
 
 def reinitPXI(force=False):
     """Tear down the current pickeringHeader and create a new one under pxiLock.
@@ -826,16 +825,34 @@ def initHardware():
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _TkLogHandler(logging.Handler):
-    def __init__(self, callback):
+    """Logging handler safe to attach to the root logger and receive records
+    from any thread.
+
+    emit() must NEVER touch a Tk widget/call .after() directly: pickeringHeader
+    (pickeringInterfaceV2.py) and RelayController (relaySerial.py) both log
+    straight to the root logger from their own background threads — not
+    through this app's logQueue/TELEM-thread — so emit() can run
+    concurrently with the main thread's own logging calls. Handler.handle()
+    holds self.lock (a per-handler RLock) across the emit() call; if emit()
+    called self.after(...) here (as an earlier version did), a background
+    thread could be blocked inside that after() call — waiting on the main
+    thread's Tk event loop — while holding self.lock, and if the main thread
+    is itself blocked in Handler.handle() waiting for the same lock (e.g.
+    logging its own message at the same moment) instead of running the event
+    loop, the two deadlock and the GUI never opens. queue.Queue.put_nowait()
+    doesn't touch Tk and can't deadlock this way; MainWindow drains it on its
+    own periodic self.after() poll instead.
+    """
+    def __init__(self):
         super().__init__()
-        self._cb = callback
+        self.queue: queue.Queue = queue.Queue()
         self.setFormatter(logging.Formatter(
             "%(asctime)s [%(threadName)s] %(levelname)s: %(message)s",
             datefmt="%H:%M:%S"))
 
     def emit(self, record):
         try:
-            self._cb(self.format(record))
+            self.queue.put_nowait(self.format(record))
         except Exception:
             pass
 
@@ -1587,8 +1604,9 @@ class GroundControllerApp(tk.Tk):
 
         stateBus.subscribe(self._on_hw_event)
 
-        logging.getLogger("ground").addHandler(
-            _TkLogHandler(lambda msg: self.after(0, self._log, msg)))
+        self._tkLogHandler = _TkLogHandler()
+        logging.getLogger().addHandler(self._tkLogHandler)
+        self.after(100, self._drain_log_handler)
 
         self._build_ui()
         self.after(150, self._init_hardware)
@@ -1960,6 +1978,18 @@ class GroundControllerApp(tk.Tk):
         self._log_box.insert("end", msg + "\n")
         self._log_box.see("end")
         self._log_box.config(state="disabled")
+
+    def _drain_log_handler(self):
+        """Pull queued log records (from _TkLogHandler, any thread) onto the
+        log box — runs on the main thread only, see _TkLogHandler docstring
+        for why emit() can't touch Tk directly."""
+        while True:
+            try:
+                msg = self._tkLogHandler.queue.get_nowait()
+            except queue.Empty:
+                break
+            self._log(msg)
+        self.after(100, self._drain_log_handler)
 
     # ── SHUTDOWN ─────────────────────────────────────────────────────────────
 
