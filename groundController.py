@@ -1,11 +1,20 @@
 
 # Author: Braedon Larsen
 # Created: 2026-06-11
-# Updated: 2026-07-06
+# Updated: 2026-07-29
 # Ground controller for 12-element phased array ultrasonic transducer system.
 # Architecture matches testHarness: worker threads, queue-based commands,
 # event-driven GUI updates via stateBus, and watchdog health monitoring.
 # All controls connect to real hardware (PXI, relay board, RS-422 serial).
+#
+# PXI/function-generator control talks to pi620lx/pilxi directly (no
+# pickeringInterfaceV2/pickeringHeader abstraction) — same configure-then-
+# outputOn() methodology as pickeringControls/pickeringConnector.py. There is
+# no arm/trigger split and no background auto-reconnect thread; a channel's
+# Apply configures it and immediately calls outputOn(), after which it either
+# free-runs or waits on the external FRONT trigger depending on physical
+# wiring. Reconnecting after a dropped session is operator-triggered only
+# (LXI Manager's Reinit button).
 
 import csv
 import logging
@@ -22,16 +31,22 @@ from tkinter import scrolledtext, ttk
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(_HERE, "spacecraftSerial"))
+sys.path.insert(0, os.path.join(_HERE, "pickeringControls", "pilxi-5.7"))
 
-from pickeringControls.pickeringInterfaceV2 import pickeringHeader
+import pilxi
+import pi620lx
 from relayControls.relaySerial import RelayController
 import serial
 
 # 41-620 attenuator: 0 dB = full-scale output, per py620 readme's documented
-# 0-40 dB attenuation range. Full-scale output is 20 Vpp. pickeringHeader's
-# phasedArray.channel.amplitude is dB (what card.setAttenuation() wants) —
-# these convert to/from the volts the GUI slider is calibrated in.
-_FULL_SCALE_VOLTS   = 20.0
+# 0-40 dB attenuation range. Full-scale output is 10 Vpp, open circuit —
+# Pickering_FuncGenManual.pdf Section 1's "Waveform Signal" spec (the
+# previous 20 Vpp value here was wrong and halved every commanded
+# amplitude — see PXI_DEBUG_NOTES.md section 10). card.setAttenuation()
+# wants dB — the GUI slider is calibrated in volts, so this converts on the
+# way in. pxiChannelState stores amp in volts (as commanded), so no reverse
+# conversion is needed on the way out.
+_FULL_SCALE_VOLTS   = 10.0
 _ATTENUATION_DB_MIN = 0.0
 _ATTENUATION_DB_MAX = 40.0
 
@@ -42,9 +57,14 @@ def _dbFromVolts(volts):
     db = 20.0 * math.log10(_FULL_SCALE_VOLTS / volts)
     return max(_ATTENUATION_DB_MIN, min(_ATTENUATION_DB_MAX, db))
 
-
-def _voltsFromDb(db):
-    return _FULL_SCALE_VOLTS * (10 ** (-db / 20.0))
+# card.generateSweep() takes an absolute frequencyStepSize_kHz +
+# frequencyStepTime_ms pair (per Pickering_FuncGenManual.pdf §4), not a rate —
+# SweepModeWindow exposes a single Hz/s "rate" dial instead, and this fixed
+# step time is what that rate gets converted against (stepSizeKHz = rate *
+# stepTime_s / 1000). 5ms matches pickeringControls/REPL_ConnectionCode.py's
+# confirmed-working value on the actual hardware — the driver rejected
+# coarser step times (e.g. 1000ms) when that was tried.
+_SWEEP_STEP_TIME_MS = 5.0
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HARDWARE CONFIGURATION
@@ -54,11 +74,21 @@ NUM_PAIRS    = 6
 NUM_RELAYS   = 4
 NUM_CHANNELS = 6   # 2 cards × 3 channels
 
+RELAY_NAMES  = ["Lights", "Cameras", "LXI", "HAVOC"]
+
 # pair_index → (card_list_index, channel_number)
 CHANNEL_MAP = {
     0: (0, 1), 1: (0, 2), 2: (0, 3),
     3: (1, 1), 4: (1, 2), 5: (1, 3),
 }
+
+# 40-115 relay card (pxiRelayCard) subunit/bit wired to the FG cards' external
+# FRONT trigger input. 1-based, matching the old pickeringInterfaceV2.py's
+# convention. Firing pulses this closed for _TRIGGER_RELAY_PULSE_S seconds
+# then reopens it — entirely separate from applying/stopping channels.
+_TRIGGER_RELAY_SUBUNIT = 1
+_TRIGGER_RELAY_BIT     = 1
+_TRIGGER_RELAY_PULSE_S = 1.0
 
 PAIR_COLORS = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948"]
 
@@ -89,9 +119,9 @@ PARAMS = [
 ]
 
 
-# pickeringHeader.phasedArray.channel.waveform_type is already a string
-# ("SINE"/"TRIANGLE"/"SQUARE") — see pickeringInterfaceV2's _WAVEFORM_TYPE_MAP.
-# RAMP/DC/PULSE/PWM/ARB have no pi620lx equivalent and are not supported.
+# Only SINE/TRIANGLE/SQUARE have a pi620lx.Card.signalShapes equivalent
+# (RAMP/DC/PULSE/PWM/ARB are not supported); the GUI has no waveform-shape
+# selector, so every channel is hardcoded to SINE.
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PORT / TIMING CONSTANTS
@@ -205,8 +235,12 @@ def _emitLog(level, message):
 # SHARED STATE
 # ══════════════════════════════════════════════════════════════════════════════
 
-pxiHeader:      pickeringHeader = None            # owns session/cards/relayCard/phasedArray; recreated on IP change/reinit
-pxiRunState:    str            = "IDLE"           # IDLE (disarmed) / ARMED (waiting on trigger) / RUNNING (triggered)
+pxiSession:     pilxi.Pi_Session = None           # None if not connected; recreated on IP change/reinit
+pxiCards:       list             = []             # pi620lx.Card, indexed like CHANNEL_MAP's card_list_index
+pxiRelayCard                     = None            # 40-115 relay card, if found — discovered but not wired into any workflow
+pxiConnected:   bool             = False
+pxiChannelState: list            = [None] * NUM_PAIRS   # last-commanded {freq, amp, offset, phase, waveform, status} per pair, or None if never applied
+pxiRunState:    str            = "IDLE"           # IDLE (output off) / RUNNING (output on, per pickeringConnector.py's methodology)
 
 
 def _setRunState(state):
@@ -227,12 +261,15 @@ relayQueue:     queue.Queue   = queue.Queue()
 logQueue:       queue.Queue   = queue.Queue()
 restartCounts:  dict          = {}
 pxiReinitCount: int           = 0    # operator-triggered reinits (IP change / manual reinit); informational only —
-                                      # pickeringHeader's own monitor thread retries connection on a fixed interval
+                                      # there is no background auto-reconnect, so this is the only way a
+                                      # dropped session gets rebuilt
 relayController: RelayController = None
 lxiErrors:      list          = []   # timestamped error strings (newest last, max 200)
 _lxiManagerWindow = None             # singleton Toplevel reference
 relayErrors:    list          = []   # timestamped relay error strings (newest last, max 200)
 _relayManagerWindow = None           # singleton Toplevel reference
+_manualModeWindow = None             # singleton Toplevel reference
+_sweepModeWindow = None              # singleton Toplevel reference
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ERROR LOG HELPERS
@@ -266,44 +303,215 @@ def updateHeartbeat(name):
 # WORKER THREADS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _waveIdx(pair_idx):
-    card_idx, ch_num = CHANNEL_MAP[pair_idx]
-    return card_idx * 3 + (ch_num - 1)
-
-
-def _notifyPair(pair_idx, channel, status):
-    """Fire a channel_update stateBus event from a phasedArray.channel + a
-    software-tracked status (IDLE/ARMED/RUNNING) — pickeringHeader/pi620lx has
-    no live read-back, so this always reflects the last-commanded state."""
+def _notifyPair(pair_idx, state):
+    """Fire a channel_update stateBus event from a pxiChannelState entry —
+    pi620lx has no live read-back, so this always reflects the
+    last-commanded state."""
     stateBus._notify("channel_update", {
         "pair": pair_idx,
-        "freq": channel.frequency, "amp": _voltsFromDb(channel.amplitude),
-        "offset": channel.offset, "phase": channel.phase,
-        "waveform": channel.waveform_type, "status": status,
-        "generating": status == "RUNNING",
+        "freq": state["freq"], "amp": state["amp"],
+        "offset": state["offset"], "phase": state["phase"],
+        "waveform": state["waveform"], "status": state["status"],
+        "generating": state["status"] == "RUNNING",
     })
 
 
 def _notifyAllPairs(status):
     for p in range(NUM_PAIRS):
-        w_idx = _waveIdx(p)
-        if pxiHeader is not None and w_idx < len(pxiHeader.phasedArray.channels):
-            _notifyPair(p, pxiHeader.phasedArray.channels[w_idx], status)
+        if pxiChannelState[p] is not None:
+            pxiChannelState[p]["status"] = status
+            _notifyPair(p, pxiChannelState[p])
+
+
+def _provisionalState(pair_idx, freq=None, amp=None, offset=None, phase=None):
+    """Build a display-only state dict for a pair that hasn't been applied
+    yet — starts from the last-commanded state (or SINE/all-zero defaults if
+    the pair was never applied) and overlays whichever params are changing."""
+    base = pxiChannelState[pair_idx]
+    state = dict(base) if base is not None else {
+        "freq": 0.0, "amp": 0.0, "offset": 0.0, "phase": 0.0,
+        "waveform": "SINE", "status": "IDLE",
+    }
+    if freq is not None:
+        state["freq"] = freq
+    if amp is not None:
+        state["amp"] = amp
+    if offset is not None:
+        state["offset"] = offset
+    if phase is not None:
+        state["phase"] = phase
+    return state
+
+
+def queuePxiApply(pair_idx, freq, amp, offset, phase, freerun=False):
+    """Enqueue an apply command, immediately notifying the GUI that this pair
+    is NOT_UPDATED (commanded but not yet executed by pxi_worker) so the
+    table reflects queue backlog instead of silently going stale.
+
+    freerun=True sends "apply_freerun" instead of "apply" — CONT trigger
+    mode, ignoring the external FRONT trigger line entirely (see
+    pxi_worker's docstring). Only Manual Mode passes this."""
+    provisional = _provisionalState(pair_idx, freq, amp, offset, phase)
+    provisional["status"] = "NOT_UPDATED"
+    _notifyPair(pair_idx, provisional)
+    cmd = "apply_freerun" if freerun else "apply"
+    pxiQueue.put((cmd, pair_idx, freq, amp, offset, phase))
+
+
+def queuePxiApplySweep(pair_idx, minFreq, maxFreq, rateHzPerSec, amp, offset):
+    """Enqueue an armed frequency-sweep apply — POSEDGE/FRONT trigger mode,
+    same as queuePxiApply()'s default (freerun=False): the channel is
+    configured and output turned on, but generation doesn't actually start
+    sweeping until the shared relay trigger fires. Used exclusively by
+    SweepModeWindow."""
+    provisional = _provisionalState(pair_idx, minFreq, amp, offset, 0.0)
+    provisional["status"] = "NOT_UPDATED"
+    _notifyPair(pair_idx, provisional)
+    pxiQueue.put(("apply_sweep", pair_idx, minFreq, maxFreq, rateHzPerSec, amp, offset))
+
+
+def queuePxiStopPair(pair_idx):
+    provisional = _provisionalState(pair_idx)
+    provisional["status"] = "NOT_UPDATED"
+    _notifyPair(pair_idx, provisional)
+    pxiQueue.put(("stop_pair", pair_idx))
+
+
+def queuePxiStopAll():
+    for p in range(NUM_PAIRS):
+        provisional = _provisionalState(p)
+        provisional["status"] = "NOT_UPDATED"
+        _notifyPair(p, provisional)
+    pxiQueue.put(("stop_all",))
+
+
+def _applyPxiChannel(pair_idx, freq, amp, offset, phase, trig_mode_name):
+    """Configure one pair's channel and call outputOn(), shared by both
+    trigger-gated ("apply") and free-running ("apply_freerun") commands —
+    see pxi_worker's docstring for when each is used."""
+    global pxiRunState
+    card_idx, ch_num = CHANNEL_MAP[pair_idx]
+    with pxiLock:
+        if card_idx < len(pxiCards):
+            card = pxiCards[card_idx]
+            try:
+                trigSource = card.triggerSources["FRONT"]
+                trigMode = card.triggerModes[trig_mode_name]
+                shape = card.signalShapes["SINE"]
+                card.setActiveChannel(ch_num)
+                card.outputOff()
+                card.setTriggerMode(trigSource, trigMode)
+                card.setOutputOffsetVoltage(offset, True)
+                card.setAttenuation(_dbFromVolts(amp))
+                card.generateSignal(
+                    frequency=freq / 1000.0, signalType=shape,
+                    startPhaseOffset=phase, symmetry=50, generate=False)
+                card.outputOn()
+                pxiChannelState[pair_idx] = {
+                    "freq": freq, "amp": amp, "offset": offset,
+                    "phase": phase, "waveform": "SINE", "status": "RUNNING",
+                }
+                pxiRunState = "RUNNING"
+                _notifyPair(pair_idx, pxiChannelState[pair_idx])
+                logMsg("INFO",
+                    f"PXI pair {pair_idx+1}: freq={freq:.0f}Hz "
+                    f"amp={amp:.3f}V offset={offset:.3f}V phase={phase:.1f}° "
+                    f"— output on ({trig_mode_name})")
+            except Exception as e:
+                logMsg("ERROR", f"PXI apply pair {pair_idx+1}: {e}")
+                _lxi_append_error(f"apply pair {pair_idx+1}: {e}")
+        else:
+            logMsg("WARNING",
+                f"PXI pair {pair_idx+1}: card {card_idx} not available "
+                f"(PXI not connected, or fewer than {card_idx+1} card(s) found)")
+
+
+def _applyPxiSweepChannel(pair_idx, minFreq, maxFreq, rateHzPerSec, amp, offset):
+    """Configure one pair's channel for a continuously-repeating frequency
+    sweep via card.generateSweep() and arm it on the external FRONT trigger
+    — otherwise identical to _applyPxiChannel()'s POSEDGE path, so
+    SweepModeWindow's Fire Trigger button (same "fire_relay" command as the
+    main window's) starts every armed channel's sweep in sync off the
+    shared relay.
+
+    generateSweep()'s own frequency args are absolute kHz + a step-size/
+    step-time pair (see _SWEEP_STEP_TIME_MS); minFreq/maxFreq/rateHzPerSec
+    here are in Hz / Hz-per-second to match this GUI's other frequency
+    controls, converted right before the call.
+
+    Trigger source/mode is FRONT + POSEDGE (front-panel input, rising edge)
+    — same as _applyPxiChannel()'s "apply" path — so the channel arms and
+    waits for the shared relay's edge exactly like a normal Apply; only
+    generateSweep() vs generateSignal() differs.
+    """
+    global pxiRunState
+    card_idx, ch_num = CHANNEL_MAP[pair_idx]
+    stepSizeKHz = rateHzPerSec * (_SWEEP_STEP_TIME_MS / 1000.0) / 1000.0
+    with pxiLock:
+        if card_idx < len(pxiCards):
+            card = pxiCards[card_idx]
+            try:
+                trigSource = card.triggerSources["FRONT"]
+                trigMode = card.triggerModes["POSEDGE"]
+                shape = card.signalShapes["SINE"]
+                card.setActiveChannel(ch_num)
+                card.outputOff()
+                card.setTriggerMode(trigSource, trigMode)
+                card.setOutputOffsetVoltage(offset, True)
+                card.setAttenuation(_dbFromVolts(amp))
+                card.generateSweep(shape, 50, 0,
+                                    minFreq / 1000.0, maxFreq / 1000.0,
+                                    stepSizeKHz, _SWEEP_STEP_TIME_MS)
+                card.outputOn()
+                pxiChannelState[pair_idx] = {
+                    "freq": minFreq, "amp": amp, "offset": offset,
+                    "phase": 0.0, "waveform": "SWEEP", "status": "RUNNING",
+                }
+                pxiRunState = "RUNNING"
+                _notifyPair(pair_idx, pxiChannelState[pair_idx])
+                logMsg("INFO",
+                    f"PXI pair {pair_idx+1}: sweep {minFreq:.0f}-{maxFreq:.0f}Hz "
+                    f"rate={rateHzPerSec:.0f}Hz/s amp={amp:.3f}V offset={offset:.3f}V "
+                    f"— armed, waiting on trigger")
+            except Exception as e:
+                logMsg("ERROR", f"PXI sweep apply pair {pair_idx+1}: {e}")
+                _lxi_append_error(f"sweep apply pair {pair_idx+1}: {e}")
+        else:
+            logMsg("WARNING",
+                f"PXI pair {pair_idx+1}: card {card_idx} not available "
+                f"(PXI not connected, or fewer than {card_idx+1} card(s) found)")
 
 
 def pxi_worker():
-    """Dequeue waveform/arm/trigger commands and apply them to the real PXI
-    hardware through pxiHeader.
+    """Dequeue apply/apply_freerun/stop_pair/stop_all/reinit commands and
+    drive the 41-620 cards directly via pi620lx, following
+    pickeringControls/pickeringConnector.py's methodology: applying
+    configures a pair's channel AND immediately calls outputOn() in the same
+    step — there is no separate arm/trigger phase.
 
-    "apply" only stages a pair's config (sendConfigToCards()) — it does not
-    make the array generate. sendConfigToCards() also outputOff()s every
-    channel as part of staging, so any apply always drops back to IDLE.
-    Generation only starts once "arm" (armFuncGens) then "trigger"
-    (triggerFuncGens) are run, which fire all 6 channels together off the
-    relay so their phases stay synchronized — that's the reason pickeringHeader
-    splits config/arm/trigger into three separate calls instead of one.
+    "apply" sets POSEDGE/FRONT trigger mode, matching pickeringConnector.py
+    exactly — after outputOn(), the channel either free-runs or waits on the
+    external FRONT trigger depending on physical wiring.
+
+    "apply_freerun" sets CONT trigger mode instead (pi620lx's "continuous"
+    mode, 0x6 — the same mode pickeringInterfaceV2 v1 used, which is why v1
+    channels always started running immediately on Apply with no cross-
+    channel phase sync). CONT ignores the trigger line entirely, so
+    outputOn() always starts the channel generating right away. Used
+    exclusively by Manual Mode (ManualModeWindow) — bubble-nucleation tuning
+    only cares that the transducers are on with the right freq/amp/offset,
+    not about staying phase-synchronized across channels, so there's no
+    reason to make the operator wait on (or fire) the external trigger while
+    dialing values in.
+
+    "apply_sweep" is like "apply" (POSEDGE/FRONT trigger, armed but not yet
+    generating) except it calls card.generateSweep() instead of
+    generateSignal() — a continuously-repeating frequency sweep instead of a
+    fixed tone. Used exclusively by SweepModeWindow.
+
+    "stop_pair" turns off just one channel — used by PairControls' Disable
+    checkbox for an immediate live effect without waiting for Apply.
     """
-    global pxiRunState
     name = "PXI"
     while not stopEvent.is_set():
         try:
@@ -316,73 +524,71 @@ def pxi_worker():
 
         if cmd == "apply" and len(item) == 6:
             _, pair_idx, freq, amp, offset, phase = item
-            wave_idx = _waveIdx(pair_idx)
-            with pxiLock:
-                if pxiHeader is not None and wave_idx < len(pxiHeader.phasedArray.channels):
-                    channel = pxiHeader.phasedArray.channels[wave_idx]
-                    channel.frequency = freq
-                    channel.amplitude = _dbFromVolts(amp)
-                    channel.offset = offset
-                    channel.phase = phase
-                    try:
-                        pxiHeader.sendConfigToCards()
-                        pxiRunState = "IDLE"
-                        _notifyPair(pair_idx, channel, "IDLE")
-                        logMsg("INFO",
-                            f"PXI pair {pair_idx+1}: staged freq={freq:.0f}Hz "
-                            f"amp={amp:.3f}V offset={offset:.3f}V phase={phase:.1f}° "
-                            f"(Arm + Trigger to generate)")
-                    except Exception as e:
-                        logMsg("ERROR", f"PXI apply pair {pair_idx+1}: {e}")
-                        _lxi_append_error(f"apply pair {pair_idx+1}: {e}")
-                else:
-                    logMsg("WARNING",
-                        f"PXI pair {pair_idx+1}: wave index {wave_idx} "
-                        f"not available (PXI not connected, or fewer than "
-                        f"{wave_idx+1} channel(s) configured)")
+            _applyPxiChannel(pair_idx, freq, amp, offset, phase, "POSEDGE")
 
-        elif cmd == "arm":
-            with pxiLock:
-                if pxiHeader is not None:
-                    try:
-                        pxiHeader.armFuncGens()
-                        pxiRunState = "ARMED"
-                        _notifyAllPairs("ARMED")
-                        logMsg("INFO", "PXI: all channels armed, waiting on trigger")
-                    except Exception as e:
-                        logMsg("ERROR", f"PXI arm failed: {e}")
-                        _lxi_append_error(f"arm failed: {e}")
-                else:
-                    logMsg("WARNING", "PXI arm ignored: not connected")
+        elif cmd == "apply_freerun" and len(item) == 6:
+            _, pair_idx, freq, amp, offset, phase = item
+            _applyPxiChannel(pair_idx, freq, amp, offset, phase, "CONT")
 
-        elif cmd == "trigger":
-            with pxiLock:
-                if pxiHeader is not None:
-                    try:
-                        pxiHeader.triggerFuncGens()
-                        pxiRunState = "RUNNING"
-                        _notifyAllPairs("RUNNING")
-                        logMsg("INFO", "PXI: triggered — all armed channels generating")
-                    except Exception as e:
-                        logMsg("ERROR", f"PXI trigger failed: {e}")
-                        _lxi_append_error(f"trigger failed: {e}")
-                else:
-                    logMsg("WARNING", "PXI trigger ignored: not connected")
+        elif cmd == "apply_sweep" and len(item) == 7:
+            _, pair_idx, minFreq, maxFreq, rateHzPerSec, amp, offset = item
+            _applyPxiSweepChannel(pair_idx, minFreq, maxFreq, rateHzPerSec, amp, offset)
 
         elif cmd == "reinit":
-            reinitPXI(force=True)  # operator-requested — bypasses nothing now, always recreates the header
+            reinitPXI(force=True)
+
+        elif cmd == "stop_pair" and len(item) == 2:
+            _, pair_idx = item
+            card_idx, ch_num = CHANNEL_MAP[pair_idx]
+            with pxiLock:
+                if card_idx < len(pxiCards):
+                    try:
+                        card = pxiCards[card_idx]
+                        card.setActiveChannel(ch_num)
+                        card.outputOff()
+                    except Exception as e:
+                        logMsg("ERROR", f"PXI stop pair {pair_idx+1}: {e}")
+                        _lxi_append_error(f"stop pair {pair_idx+1}: {e}")
+                if pxiChannelState[pair_idx] is not None:
+                    pxiChannelState[pair_idx]["status"] = "IDLE"
+                    _notifyPair(pair_idx, pxiChannelState[pair_idx])
+            logMsg("INFO", f"PXI pair {pair_idx+1}: disabled (output off)")
 
         elif cmd == "stop_all":
             with pxiLock:
-                if pxiHeader is not None:
-                    try:
-                        pxiHeader.disarmFuncGens()
-                    except Exception as e:
-                        logMsg("ERROR", f"PXI disarm failed: {e}")
-                        _lxi_append_error(f"disarm failed: {e}")
+                for pair_idx in range(NUM_PAIRS):
+                    card_idx, ch_num = CHANNEL_MAP[pair_idx]
+                    if card_idx < len(pxiCards):
+                        try:
+                            card = pxiCards[card_idx]
+                            card.setActiveChannel(ch_num)
+                            card.outputOff()
+                        except Exception as e:
+                            logMsg("ERROR", f"PXI stop pair {pair_idx+1}: {e}")
+                            _lxi_append_error(f"stop pair {pair_idx+1}: {e}")
                 pxiRunState = "IDLE"
                 _notifyAllPairs("IDLE")
-            logMsg("INFO", "PXI: all channels disarmed/stopped")
+            logMsg("INFO", "PXI: all channels stopped")
+
+        elif cmd == "fire_relay":
+            # Fires the external trigger line by closing the 40-115 relay for
+            # _TRIGGER_RELAY_PULSE_S seconds, then reopening it. Does not
+            # touch any function generator channel/output — channels must
+            # already be armed (outputOn() called via "apply") and waiting on
+            # this trigger for anything to actually start generating.
+            with pxiLock:
+                if pxiRelayCard is not None:
+                    try:
+                        pxiRelayCard.OpBit(_TRIGGER_RELAY_SUBUNIT, _TRIGGER_RELAY_BIT, True)
+                        logMsg("INFO", "PXI relay: closed — firing trigger")
+                        stopEvent.wait(_TRIGGER_RELAY_PULSE_S)
+                        pxiRelayCard.OpBit(_TRIGGER_RELAY_SUBUNIT, _TRIGGER_RELAY_BIT, False)
+                        logMsg("INFO", "PXI relay: reopened")
+                    except Exception as e:
+                        logMsg("ERROR", f"PXI relay fire failed: {e}")
+                        _lxi_append_error(f"relay fire failed: {e}")
+                else:
+                    logMsg("WARNING", "PXI relay fire ignored: no relay card found")
 
         updateHeartbeat(name)
 
@@ -544,8 +750,43 @@ def restartThread(name):
 # PXI HARDWARE HEALTH  (mirrors flightController pattern)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _openPXI():
+    """One-shot connect + card discovery, mirroring pickeringConnector.py's
+    session/base/findCards/openCard sequence exactly. The 40-115 relay card
+    (if present) is found the same way pickeringInterfaceV2 used to (scan
+    session.FindFreeCards(), match CardId()) but is only stored — nothing
+    currently wires it into arm/trigger, since pickeringConnector.py's
+    methodology doesn't use it. Raises on failure; caller decides how to log
+    it. No background reconnect thread — call reinitPXI() (operator-
+    triggered, e.g. LXI Manager's Reinit button) to rebuild a dropped
+    connection.
+    """
+    global pxiSession, pxiCards, pxiRelayCard, pxiConnected
+    pxiSession = pilxi.Pi_Session(PXI_IP, timeout=PXI_CONNECT_TIMEOUT_MS)
+    sessionID = pxiSession.GetSessionID()
+    base = pi620lx.Base(sessionID)
+
+    cards = []
+    for bus, device in base.findCards():
+        card = base.openCard(bus, device)
+        card._bus = bus
+        card._device = device
+        cards.append(card)
+    pxiCards = cards
+
+    pxiRelayCard = None
+    for bus, device in pxiSession.FindFreeCards():
+        candidate = pxiSession.OpenCard(bus, device)
+        if "40-115" in candidate.CardId():
+            pxiRelayCard = candidate
+            break
+
+    pxiConnected = True
+
+
 def checkPXIHealth():
-    """Returns True if pxiHeader reports a connected session with cards found.
+    """Returns True if the last _openPXI()/reinitPXI() call succeeded and
+    found at least one function generator card.
 
     NOTE: this is NOT a live round-trip ping. pi620lx.Card.revisionQuery()
     would be the natural candidate for one, but the vendor's pilxi-5.7/
@@ -553,40 +794,40 @@ def checkPXIHealth():
     .value, so _pythonString()'s .decode() always throws) that makes it
     always report failure regardless of actual card state — see the
     revisionQuery() docstring/TODO in that file before ever calling it here
-    again. So this only reflects pxiHeader.connectionStatus (set once at
-    connect time, cleared only if _monitorLXI's own reconnect logic fires) —
-    a hung/unresponsive chassis that never raises won't be caught by this
-    check. Real hardware errors will still surface individually through
-    sendConfigToCards()/armFuncGens()/etc. in pxi_worker.
+    again. So this only reflects pxiConnected (set once at connect time —
+    there is no background reconnect logic to clear it) — a hung/
+    unresponsive chassis that never raises won't be caught by this check.
+    Real hardware errors will still surface individually through
+    pxi_worker's apply/stop_all handlers.
     """
-    return pxiHeader is not None and pxiHeader.connectionStatus and bool(pxiHeader.cards)
+    return pxiConnected and bool(pxiCards)
 
 def reinitPXI(force=False):
-    """Tear down the current pickeringHeader and create a new one under pxiLock.
+    """Tear down the current session and reconnect under pxiLock.
 
-    pickeringHeader owns its own background monitor thread that opens the LXI
-    connection immediately on construction and keeps retrying on a fixed
-    healthInterval afterward — there is no backoff to bypass here anymore
-    (unlike the old free-function initPXIE()-based reinit). This is
-    operator-triggered only (IP change / manual reinit button); the watchdog
-    never calls this automatically on a failed health check.
+    Operator-triggered only (IP change / manual reinit button) — there is no
+    background auto-reconnect thread; the watchdog never calls this
+    automatically on a failed health check.
     """
-    global pxiHeader, pxiRunState, pxiReinitCount
+    global pxiSession, pxiCards, pxiRelayCard, pxiConnected, pxiRunState, pxiReinitCount
     pxiReinitCount += 1
     logMsg("WARNING", f"PXI reinit #{pxiReinitCount}: recreating connection to {PXI_IP}")
     with pxiLock:
-        if pxiHeader is not None:
+        if pxiSession is not None:
             try:
-                pxiHeader.closeLXI()
+                pxiSession.Close()
             except Exception as e:
                 logMsg("ERROR", f"PXI reinit: error closing previous session: {e}")
+        pxiSession = None
+        pxiCards = []
+        pxiRelayCard = None
+        pxiConnected = False
         try:
-            pxiHeader = pickeringHeader(PXI_IP, PXI_CONNECT_TIMEOUT_MS)
+            _openPXI()
             pxiRunState = "IDLE"
-            logMsg("INFO", f"PXI reinit: new pickeringHeader created for {PXI_IP} "
-                            f"(connecting in background)")
+            logMsg("INFO", f"PXI reinit: connected to {PXI_IP}, "
+                            f"{len(pxiCards)} card(s) found")
         except Exception as e:
-            pxiHeader = None
             logMsg("ERROR", f"PXI reinit failed: {e}")
             _lxi_append_error(f"reinit failed: {e}")
 
@@ -614,7 +855,8 @@ def _reconnect_relay(new_port: str) -> None:
 # waveConfigs but without activeTime/settlingTime)
 # ══════════════════════════════════════════════════════════════════════════════
 
-GROUND_CONFIG_FIELDS = ["channel", "frequency", "amplitude", "offset", "phase", "waveform_type"]
+GROUND_CONFIG_FIELDS = ["channel", "frequency", "amplitude", "offset", "phase",
+                        "waveform_type", "ring", "disabled"]
 
 
 def _ensureGroundConfigsDir():
@@ -632,31 +874,38 @@ def listGroundConfigs():
 
 
 def saveGroundConfig(name, gui_values=None):
-    """Write the currently-staged hardware state (pxiHeader.phasedArray) to
+    """Write the currently-commanded hardware state (pxiChannelState) to
     groundConfigs/<name>.csv.
 
-    gui_values, if given, is a list of (freq, amp, offset, phase) indexed by
-    pair_idx — used as a fallback for any pair whose hardware waveform isn't
-    available (e.g. PXI not connected), so saving still captures what the
+    gui_values, if given, is a list of (freq, amp, offset, phase, ring,
+    disabled) indexed by pair_idx. freq/amp/offset/phase fall back to
+    gui_values for any pair whose hardware state isn't available (e.g. PXI
+    not connected, or never applied), so saving still captures what the
     operator has set on the sliders instead of silently dropping the pair.
+    ring/disabled are pure GUI/software concepts pi620lx knows nothing about,
+    so they always come from gui_values (defaulting to Outer/enabled if
+    gui_values wasn't supplied at all).
     """
     _ensureGroundConfigsDir()
     path = os.path.join(GROUND_CONFIGS_DIR, f"{name}.csv")
     rows = []
     with pxiLock:
-        channels = pxiHeader.phasedArray.channels if pxiHeader is not None else []
         for pair_idx in range(NUM_PAIRS):
             card_idx, ch_num = CHANNEL_MAP[pair_idx]
-            wave_idx = card_idx * 3 + (ch_num - 1)
-            if wave_idx < len(channels):
-                channel = channels[wave_idx]
+            state = pxiChannelState[pair_idx]
+            if gui_values is not None and pair_idx < len(gui_values):
+                ring, disabled = gui_values[pair_idx][4], gui_values[pair_idx][5]
+            else:
+                ring, disabled = "Outer", False
+            if state is not None:
                 rows.append([
-                    ch_num, channel.frequency, _voltsFromDb(channel.amplitude),
-                    channel.offset, channel.phase, channel.waveform_type,
+                    ch_num, state["freq"], state["amp"],
+                    state["offset"], state["phase"], state["waveform"],
+                    ring, disabled,
                 ])
             elif gui_values is not None and pair_idx < len(gui_values):
-                freq, amp, offset, phase = gui_values[pair_idx]
-                rows.append([ch_num, freq, amp, offset, phase, "SINE"])
+                freq, amp, offset, phase = gui_values[pair_idx][:4]
+                rows.append([ch_num, freq, amp, offset, phase, "SINE", ring, disabled])
     if not rows:
         logMsg("WARNING", f"Ground config '{name}' saved with no pairs "
                            f"(no hardware and no GUI values available)")
@@ -668,7 +917,11 @@ def saveGroundConfig(name, gui_values=None):
 
 
 def loadGroundConfig(name):
-    """Read groundConfigs/<name>.csv, one row per pair in CHANNEL_MAP order."""
+    """Read groundConfigs/<name>.csv, one row per pair in CHANNEL_MAP order.
+
+    ring/disabled default to Outer/False for configs saved before those
+    columns existed.
+    """
     path = os.path.join(GROUND_CONFIGS_DIR, f"{name}.csv")
     rows = []
     with open(path, newline="") as f:
@@ -679,6 +932,8 @@ def loadGroundConfig(name):
                 "amplitude": float(row["amplitude"]),
                 "offset":    float(row["offset"]),
                 "phase":     float(row["phase"]),
+                "ring":      row.get("ring") or "Outer",
+                "disabled":  str(row.get("disabled", "False")).strip().lower() == "true",
             })
     return rows
 
@@ -750,8 +1005,14 @@ def triggerSafeMode():
 
     try:
         with pxiLock:
-            if pxiHeader is not None:
-                pxiHeader.disarmFuncGens()
+            for pair_idx in range(NUM_PAIRS):
+                card_idx, ch_num = CHANNEL_MAP[pair_idx]
+                if card_idx < len(pxiCards):
+                    card = pxiCards[card_idx]
+                    card.setActiveChannel(ch_num)
+                    card.outputOff()
+            if pxiRelayCard is not None:
+                pxiRelayCard.OpBit(_TRIGGER_RELAY_SUBUNIT, _TRIGGER_RELAY_BIT, False)
             _setRunState("IDLE")
         logMsg("INFO", "Safe mode: PXI outputs disarmed")
     except Exception as e:
@@ -764,34 +1025,21 @@ def triggerSafeMode():
 
 def initHardware():
     """Initialize all hardware and start all worker threads. Returns a status string."""
-    global relayController, pxiHeader
+    global relayController
     errors = []
 
     startThread("TELEM")   # start logger first so all subsequent logMsg calls work
 
     try:
-        pxiHeader = pickeringHeader(PXI_IP, PXI_CONNECT_TIMEOUT_MS)
-        # pickeringHeader connects on its own background thread (see
-        # pickeringInterfaceV2_README.md); block briefly here — comparable to
-        # the old synchronous initPXIE() call — so the returned status
-        # reflects real connection state instead of always reporting 0 cards.
-        deadline = time.monotonic() + (PXI_CONNECT_TIMEOUT_MS / 1000.0) + 1.0
-        while time.monotonic() < deadline and not pxiHeader.connectionStatus:
-            time.sleep(0.1)
-        if pxiHeader.connectionStatus and pxiHeader.cards:
-            logMsg("INFO",
-                f"PXI: {len(pxiHeader.cards)} card(s) initialized, "
-                f"{len(pxiHeader.phasedArray.channels)} channels ready")
-        elif pxiHeader.connectionStatus:
+        _openPXI()   # synchronous, one-shot — see _openPXI()'s docstring
+        if pxiCards:
+            logMsg("INFO", f"PXI: {len(pxiCards)} card(s) initialized")
+        else:
             logMsg("ERROR", f"PXI: connected to {PXI_IP} but found 0 function "
                              f"generator cards (already claimed by another session?)")
             _lxi_append_error(f"connected to {PXI_IP} but found 0 cards "
                                f"(already claimed by another session?)")
             errors.append("PXI: 0 cards found")
-        else:
-            logMsg("WARNING", f"PXI: still connecting to {PXI_IP} in the "
-                               f"background — check LXI Manager for status")
-            errors.append("PXI: connecting")
     except Exception as e:
         logMsg("ERROR", f"PXI init failed: {e}")
         _lxi_append_error(f"startup init failed (IP {PXI_IP}): {e}")
@@ -816,7 +1064,7 @@ def initHardware():
 
     if errors:
         return "Partial init — " + "; ".join(errors)
-    n = len(pxiHeader.cards)
+    n = len(pxiCards)
     return f"Ready — {n} PXI card{'s' if n != 1 else ''}"
 
 
@@ -828,10 +1076,9 @@ class _TkLogHandler(logging.Handler):
     """Logging handler safe to attach to the root logger and receive records
     from any thread.
 
-    emit() must NEVER touch a Tk widget/call .after() directly: pickeringHeader
-    (pickeringInterfaceV2.py) and RelayController (relaySerial.py) both log
-    straight to the root logger from their own background threads — not
-    through this app's logQueue/TELEM-thread — so emit() can run
+    emit() must NEVER touch a Tk widget/call .after() directly: RelayController
+    (relaySerial.py) logs straight to the root logger from its own background
+    thread — not through this app's logQueue/TELEM-thread — so emit() can run
     concurrently with the main thread's own logging calls. Handler.handle()
     holds self.lock (a per-handler RLock) across the emit() call; if emit()
     called self.after(...) here (as an earlier version did), a background
@@ -899,9 +1146,11 @@ class ArrayDiagram(tk.Canvas):
         legend_y = h - NUM_PAIRS * 18 - 6
         for p in range(NUM_PAIRS):
             lx, ly = 8, legend_y + p * 18
+            card_idx, ch_num = CHANNEL_MAP[p]
             self.create_oval(lx, ly, lx + 12, ly + 12,
                 fill=PAIR_COLORS[p], outline="")
-            self.create_text(lx + 18, ly + 6, anchor="w", text=f"Pair {p + 1}",
+            self.create_text(lx + 18, ly + 6, anchor="w",
+                text=f"Card {card_idx + 1} Ch {ch_num}",
                 fill=FG_DIM, font=("Helvetica", 8))
 
     def _on_click(self, event):
@@ -956,15 +1205,25 @@ class ScrollFrame(tk.Frame):
 # PAIR CONTROLS  (modified: _apply() queues a command instead of calling hardware)
 # ══════════════════════════════════════════════════════════════════════════════
 
+RING_OPTIONS = ["Inner", "Outer"]
+
+
 class PairControls(tk.Frame):
     """Slider + entry controls for one transducer pair.
 
     Clicking Apply puts an ("apply", pair_idx, freq, amp, offset, phase) tuple
-    on pxiQueue. The pxi_worker picks it up, stages the values onto
-    pxiHeader (sendConfigToCards()), and fires a stateBus "channel_update"
-    event so the LXI table refreshes. This only stages the config — it does
-    not make the array generate; use the main window's Arm + Trigger buttons
-    for that (see pxi_worker's docstring).
+    on pxiQueue. pxi_worker picks it up, configures that pair's channel
+    directly on the 41-620 card, and immediately calls outputOn() — there is
+    no separate arm/trigger step (see pxi_worker's docstring). A stateBus
+    "channel_update" event fires afterward so the LXI table refreshes.
+
+    Each pair also has a Ring dropdown (Inner/Outer — a pure GUI/software
+    grouping consumed by GroundControllerApp's ring panel, not sent to
+    hardware on its own) and a Disable checkbox: checking it immediately
+    sends a ("stop_pair", pair_idx) command (outputOff on that channel right
+    away) and greys out the sliders/entries/Apply button so they can't be
+    used while disabled; unchecking re-enables them but does not resume
+    output on its own — Apply must be clicked again.
     """
 
     def __init__(self, parent, pair_idx, on_focus=None, **kw):
@@ -977,6 +1236,9 @@ class PairControls(tk.Frame):
         self._entries = {}
         self._scales  = {}
         self._sl_bounds = {}
+        self._locked  = False   # True while Manual Mode owns the array — see set_locked()
+        card_idx, ch_num = CHANNEL_MAP[pair_idx]
+        self._label_text = f"Card {card_idx + 1} Ch {ch_num}"
         self._build()
 
     def _build(self):
@@ -985,8 +1247,8 @@ class PairControls(tk.Frame):
 
         tk.Label(self, text="●", fg=color, bg=bg,
                  font=("Helvetica", 16)).grid(row=0, column=0, rowspan=2, padx=(2, 4))
-        tk.Label(self, text=f"Pair {self._idx + 1}", fg=FG, bg=bg,
-                 font=("Helvetica", 9, "bold"), width=6, anchor="w").grid(
+        tk.Label(self, text=self._label_text, fg=FG, bg=bg,
+                 font=("Helvetica", 9, "bold"), width=12, anchor="w").grid(
             row=0, column=1, rowspan=2, padx=(0, 10))
 
         for col_i, (key, label, hard_min, hard_max,
@@ -1021,10 +1283,32 @@ class PairControls(tk.Frame):
                        lambda _: self._on_focus and self._on_focus(self._idx))
             self._entries[key] = (entry, fmt, hard_min, hard_max)
 
-        tk.Button(self, text="Apply", bg=BG_HL, fg=FG, relief="flat",
+        ring_col = len(PARAMS) * 3 + 2
+        tk.Label(self, text="Ring", fg=FG_DIM, bg=bg,
+                 font=("Helvetica", 8), anchor="center").grid(
+            row=0, column=ring_col, sticky="ew", padx=2)
+        # Default: first 2 pairs Inner, remaining 4 Outer — a starting point
+        # only; freely reassignable per-pair, not enforced (see AskUserQuestion
+        # decision: "freely assignable, no enforcement").
+        self._ring_var = tk.StringVar(value="Inner" if self._idx < 2 else "Outer")
+        self._ring_box = ttk.Combobox(self, textvariable=self._ring_var, values=RING_OPTIONS,
+                                 state="readonly", width=6)
+        self._ring_box.grid(row=1, column=ring_col, padx=(2, 8))
+
+        disable_col = ring_col + 1
+        tk.Label(self, text="Disable", fg=FG_DIM, bg=bg,
+                 font=("Helvetica", 8), anchor="center").grid(
+            row=0, column=disable_col, sticky="ew", padx=2)
+        self._disabled_var = tk.BooleanVar(value=False)
+        self._disable_chk = tk.Checkbutton(self, variable=self._disabled_var, bg=bg,
+                        activebackground=bg, highlightthickness=0,
+                        command=self._on_disable_toggle)
+        self._disable_chk.grid(row=1, column=disable_col, padx=(2, 8))
+
+        self._apply_btn = tk.Button(self, text="Apply", bg=BG_HL, fg=FG, relief="flat",
                   padx=8, activebackground=color, activeforeground="white",
-                  command=self._apply).grid(
-            row=0, column=len(PARAMS) * 3 + 2, rowspan=2, padx=(4, 2))
+                  command=self._apply)
+        self._apply_btn.grid(row=0, column=disable_col + 1, rowspan=2, padx=(4, 2))
 
     def _push_to_entry(self, key, val, fmt):
         entry, _, _, _ = self._entries[key]
@@ -1055,28 +1339,83 @@ class PairControls(tk.Frame):
         entry.delete(0, "end")
         entry.insert(0, format(val, fmt))
 
-    def _apply(self):
+    def _on_disable_toggle(self):
+        disabled = self._disabled_var.get()
+        self._refresh_lock_state()
+        if disabled:
+            queuePxiStopPair(self._idx)
+
+    def _apply(self, freerun=False):
+        if self._disabled_var.get() or self._locked:
+            return
         if self._on_focus:
             self._on_focus(self._idx)
-        pxiQueue.put((
-            "apply", self._idx,
+        queuePxiApply(
+            self._idx,
             self._vars["freq"].get(),
             self._vars["amp"].get(),
             self._vars["offset"].get(),
             self._vars["phase"].get(),
-        ))
+            freerun=freerun,
+        )
 
-    def apply(self):
-        """Public entry point used by 'Apply All Pairs'."""
-        self._apply()
+    def set_locked(self, locked):
+        """Grey out this pair's controls without touching hardware — used
+        while Manual Mode owns the array. Distinct from the Disable
+        checkbox (which also stops output); on unlock, state reverts to
+        whatever the Disable checkbox says it should be."""
+        self._locked = locked
+        self._refresh_lock_state()
+
+    def _refresh_lock_state(self):
+        state = "disabled" if (self._locked or self._disabled_var.get()) else "normal"
+        for scale in self._scales.values():
+            scale.configure(state=state)
+        for entry, _, _, _ in self._entries.values():
+            entry.configure(state=state)
+        self._apply_btn.configure(state=state)
+        self._ring_box.configure(state=("disabled" if self._locked else "readonly"))
+        self._disable_chk.configure(state=("disabled" if self._locked else "normal"))
+
+    def apply(self, freerun=False):
+        """Public entry point used by 'Apply All Pairs' and Manual Mode
+        (freerun=True — see queuePxiApply's docstring)."""
+        self._apply(freerun=freerun)
+
+    def apply_param(self, key, val):
+        """Set one param (clamped to its hard bounds) without applying —
+        used by the ring/global-frequency panel to stage values onto
+        multiple pairs before applying them together."""
+        _, fmt, lo, hi = self._entries[key]
+        clamped = max(lo, min(hi, val))
+        self._set_value(key, clamped, fmt)
+
+    def get_ring(self):
+        return self._ring_var.get()
+
+    def set_ring(self, ring):
+        if ring in RING_OPTIONS:
+            self._ring_var.set(ring)
+
+    def is_disabled(self):
+        return self._disabled_var.get()
+
+    def set_disabled(self, disabled):
+        if disabled != self._disabled_var.get():
+            self._disabled_var.set(disabled)
+            self._on_disable_toggle()
 
     def get_values(self):
-        """Current freq/amp/offset/phase as shown in the sliders/entries."""
+        """Current freq/amp/offset/phase/ring/disabled as shown in the GUI."""
         return (self._vars["freq"].get(), self._vars["amp"].get(),
-                self._vars["offset"].get(), self._vars["phase"].get())
+                self._vars["offset"].get(), self._vars["phase"].get(),
+                self._ring_var.get(), self._disabled_var.get())
 
-    def load_values(self, freq, amp, offset, phase):
-        """Populate sliders/entries from a saved config and immediately apply."""
+    def load_values(self, freq, amp, offset, phase, ring="Outer", disabled=False):
+        """Populate sliders/entries/ring/disable from a saved config and
+        immediately apply (unless disabled)."""
+        self.set_disabled(disabled)
+        self.set_ring(ring)
         for key, val in (("freq", freq), ("amp", amp), ("offset", offset), ("phase", phase)):
             _, fmt, lo, hi = self._entries[key]
             clamped = max(lo, min(hi, val))
@@ -1237,11 +1576,11 @@ class LXIManagerWindow(tk.Toplevel):
         if not self.winfo_exists():
             return
 
-        # Connection status derived from pxiHeader directly
+        # Connection status derived from the raw pxiSession/pxiCards globals directly
         with pxiLock:
-            connected = pxiHeader is not None and pxiHeader.connectionStatus
-            n_cards = len(pxiHeader.cards) if pxiHeader is not None else 0
-            has_relay = pxiHeader is not None and pxiHeader.relayCard is not None
+            connected = pxiConnected
+            n_cards = len(pxiCards)
+            has_relay = pxiRelayCard is not None
         if connected:
             self._status_dot.config(fg=GREEN)
             self._status_lbl.config(text="CONNECTED", fg=GREEN)
@@ -1275,36 +1614,35 @@ class LXIManagerWindow(tk.Toplevel):
         pi620lx.Card has no CardId()/CardLoc() (unlike pilxi's
         Pi_Card_ByDevice) and no PIFGLX_Get* read-back, so this can no longer
         show a live per-channel generator status table — only the bus/device
-        location pickeringHeader stamped onto each card (card._bus/_device)
-        plus a static model label, since pi620lx.Base.findCards() only ever
-        returns 41-620 cards by construction. The main window's per-pair
-        display still echoes the last commanded value only. The relay card
-        (40-115) is shown as its own row since it's identified separately
-        from the FG cards.
+        location _openPXI() stamped onto each card (card._bus/_device) plus a
+        static model label, since pi620lx.Base.findCards() only ever returns
+        41-620 cards by construction. The main window's per-pair display
+        still echoes the last commanded value only. The relay card (40-115)
+        is shown as its own row since it's identified separately from the FG
+        cards — though nothing currently drives it (discovered but unused).
         """
         rows = []
         with pxiLock:
-            if pxiHeader is not None:
-                for idx, card in enumerate(pxiHeader.cards):
-                    bus = getattr(card, "_bus", "?")
-                    device = getattr(card, "_device", "?")
-                    rows.append({
-                        "idx":    idx,
-                        "model":  "41-620 FG",
-                        "bus":    str(bus),
-                        "slot":   str(device),
-                        "ts":     time.strftime("%H:%M:%S"),
-                    })
-                if pxiHeader.relayCard is not None:
-                    bus = getattr(pxiHeader.relayCard, "_bus", "?")
-                    device = getattr(pxiHeader.relayCard, "_device", "?")
-                    rows.append({
-                        "idx":    len(pxiHeader.cards),
-                        "model":  "40-115 Relay",
-                        "bus":    str(bus),
-                        "slot":   str(device),
-                        "ts":     time.strftime("%H:%M:%S"),
-                    })
+            for idx, card in enumerate(pxiCards):
+                bus = getattr(card, "_bus", "?")
+                device = getattr(card, "_device", "?")
+                rows.append({
+                    "idx":    idx,
+                    "model":  "41-620 FG",
+                    "bus":    str(bus),
+                    "slot":   str(device),
+                    "ts":     time.strftime("%H:%M:%S"),
+                })
+            if pxiRelayCard is not None:
+                bus = getattr(pxiRelayCard, "_bus", "?")
+                device = getattr(pxiRelayCard, "_device", "?")
+                rows.append({
+                    "idx":    len(pxiCards),
+                    "model":  "40-115 Relay",
+                    "bus":    str(bus),
+                    "slot":   str(device),
+                    "ts":     time.strftime("%H:%M:%S"),
+                })
 
         self.after(0, self._update_card_table, rows)
 
@@ -1420,7 +1758,7 @@ class RelayManagerWindow(tk.Toplevel):
         self._disc_lbls:  list[tk.Label] = []
 
         for i in range(NUM_RELAYS):
-            tk.Label(relay_frame, text=f"Relay {i}", bg=BG, fg=FG,
+            tk.Label(relay_frame, text=RELAY_NAMES[i], bg=BG, fg=FG,
                      font=("Courier", 8), width=7, anchor="w").grid(
                 row=i + 1, column=0, padx=4, pady=2)
 
@@ -1585,6 +1923,655 @@ class RelayManagerWindow(tk.Toplevel):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MANUAL MODE  (bubble-nucleation frequency/amplitude sweep — phase not a
+# concern here, only freq/amp; see AskUserQuestion decisions: coarse/fine
+# slider pairs, debounced real-time apply, NOT_UPDATED via the queue helpers
+# above, lock only per-pair/ring controls)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_MANUAL_DEBOUNCE_MS = 100   # ms of slider/entry inactivity before an apply is sent
+
+# (key, label, hard_min, hard_max, default, fmt, fine_span) — fine_span is the
+# +/- window the fine slider covers around the current value.
+MANUAL_PARAMS = [
+    ("freq",   "Frequency (Hz)", 100.0, 1_000_000.0, 40_000.0, ".0f", 2_000.0),
+    ("amp",    "Amplitude (V)",    0.0,        20.0,     10.0,  ".3f",     1.0),
+    ("offset", "Offset (V)",       0.0,         5.0,      0.0,  ".3f",     0.5),
+]
+
+# (key, label, hard_min, hard_max, default, fmt, fine_span) — same shape as
+# MANUAL_PARAMS, consumed by SweepModeWindow's DialControls. "rate" is Hz/s,
+# not a raw card parameter — see _SWEEP_STEP_TIME_MS/_applyPxiSweepChannel
+# for the conversion into generateSweep()'s stepSize/stepTime.
+SWEEP_PARAMS = [
+    ("minFreq", "Min Frequency (Hz)", 100.0, 1_000_000.0, 20_000.0, ".0f", 2_000.0),
+    ("maxFreq", "Max Frequency (Hz)", 100.0, 1_000_000.0, 60_000.0, ".0f", 2_000.0),
+    ("rate",    "Sweep Rate (Hz/s)",    0.0,   500_000.0, 10_000.0, ".0f", 5_000.0),
+    ("amp",     "Amplitude (V)",        0.0,        20.0,     10.0, ".3f",     1.0),
+    ("offset",  "Offset (V)",           0.0,         5.0,      0.0, ".3f",     0.5),
+]
+
+
+class DialControl(tk.Frame):
+    """One power-supply-style control: a coarse slider spanning the full
+    range, a fine slider spanning a small window around the current value,
+    and a numeric entry — all three always agree on the same value. Moving
+    any of them schedules on_commit(value) after _MANUAL_DEBOUNCE_MS of
+    inactivity (coalesces bursts of slider motion into one hardware command
+    instead of flooding pxiQueue — see AskUserQuestion's 'debounced' choice).
+    """
+
+    def __init__(self, parent, label, lo, hi, default, fmt, fine_span, on_commit, **kw):
+        kw.setdefault("bg", BG)
+        super().__init__(parent, **kw)
+        self._lo, self._hi = lo, hi
+        self._fmt = fmt
+        self._fine_span = fine_span
+        self._on_commit = on_commit
+        self._base = default     # value the fine slider's zero point sits at
+        self._value = default    # last-known absolute value
+        self._debounce_id = None
+        self._suspend = False    # True while programmatically syncing widgets
+
+        tk.Label(self, text=label, fg=FG, bg=self["bg"],
+                 font=("Helvetica", 9, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
+
+        tk.Label(self, text="Coarse", fg=FG_DIM, bg=self["bg"],
+                 font=("Helvetica", 8)).grid(row=1, column=0, sticky="w")
+        self._coarse_var = tk.DoubleVar(value=default)
+        self._coarse = tk.Scale(
+            self, from_=lo, to=hi, variable=self._coarse_var,
+            orient="horizontal", length=220, showvalue=False,
+            bg=self["bg"], fg=FG, troughcolor=BG_HL,
+            activebackground=BLUE, highlightthickness=0, bd=0,
+            command=self._on_coarse_move)
+        self._coarse.grid(row=1, column=1, sticky="ew", padx=(6, 0))
+
+        tk.Label(self, text="Fine", fg=FG_DIM, bg=self["bg"],
+                 font=("Helvetica", 8)).grid(row=2, column=0, sticky="w")
+        self._fine_var = tk.DoubleVar(value=0.0)
+        self._fine = tk.Scale(
+            self, from_=-fine_span, to=fine_span, variable=self._fine_var,
+            orient="horizontal", length=220, showvalue=False,
+            bg=self["bg"], fg=FG, troughcolor=BG_HL,
+            activebackground=GREEN, highlightthickness=0, bd=0,
+            command=self._on_fine_move)
+        self._fine.grid(row=2, column=1, sticky="ew", padx=(6, 0))
+
+        entry_row = tk.Frame(self, bg=self["bg"])
+        entry_row.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        tk.Label(entry_row, text="Value:", fg=FG_DIM, bg=self["bg"],
+                 font=("Helvetica", 8)).pack(side="left")
+        self._entry = tk.Entry(entry_row, width=12, justify="center",
+                               bg=BG_HL, fg=FG, insertbackground=FG,
+                               relief="flat", bd=2)
+        self._entry.insert(0, format(default, fmt))
+        self._entry.pack(side="left", padx=(6, 0))
+        self._entry.bind("<Return>", self._on_entry_commit)
+        self._entry.bind("<FocusOut>", self._on_entry_commit)
+
+        self.columnconfigure(1, weight=1)
+
+    # ── widget callbacks ──────────────────────────────────────────────────
+
+    def _on_coarse_move(self, v):
+        if self._suspend:
+            return
+        self._base = float(v)
+        self._suspend = True
+        self._fine_var.set(0.0)
+        self._suspend = False
+        self._set_value(self._base)
+
+    def _on_fine_move(self, v):
+        if self._suspend:
+            return
+        val = max(self._lo, min(self._hi, self._base + float(v)))
+        self._set_value(val)
+
+    def _on_entry_commit(self, _event):
+        try:
+            val = max(self._lo, min(self._hi, float(self._entry.get())))
+        except ValueError:
+            return
+        self.set_absolute(val, notify=True)
+
+    def _set_value(self, val):
+        self._value = val
+        self._entry.delete(0, "end")
+        self._entry.insert(0, format(val, self._fmt))
+        self._schedule_commit()
+
+    def _schedule_commit(self):
+        if self._debounce_id is not None:
+            self.after_cancel(self._debounce_id)
+        self._debounce_id = self.after(_MANUAL_DEBOUNCE_MS, self._fire_commit)
+
+    def _fire_commit(self):
+        self._debounce_id = None
+        if self._on_commit:
+            self._on_commit(self._value)
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def set_absolute(self, val, notify):
+        """Programmatically set the control to val, re-centering both
+        sliders on it. If notify is False (e.g. loading a newly-selected
+        channel's current value), on_commit is NOT fired — this just
+        reflects existing state rather than commanding a change."""
+        val = max(self._lo, min(self._hi, val))
+        self._base = val
+        self._value = val
+        self._suspend = True
+        self._coarse_var.set(val)
+        self._fine_var.set(0.0)
+        self._suspend = False
+        self._entry.delete(0, "end")
+        self._entry.insert(0, format(val, self._fmt))
+        if notify:
+            self._schedule_commit()
+        elif self._debounce_id is not None:
+            self.after_cancel(self._debounce_id)
+            self._debounce_id = None
+
+    def get(self):
+        return self._value
+
+
+class ManualModeWindow(tk.Toplevel):
+    """Standalone window for manually dialing in frequency/amplitude/offset —
+    phase isn't a concern here (bubble nucleation tuning only cares about
+    freq/amp/offset), so PairControls' phase value is simply carried through
+    untouched. Reuses PairControls.apply_param()+apply() (the same path the
+    main window's Ring/Global-Frequency panel already uses) rather than
+    talking to pxiQueue directly, so NOT_UPDATED/RUNNING tracking and the
+    main LXI table stay in sync for free.
+
+    Opening this window locks the main window's per-pair and ring/global
+    controls (via app._set_array_controls_locked) so the two can't fight
+    over the same channels; closing it unlocks them again.
+
+    A STOP/ENGAGE interlock gates all of this: the window opens STOPPED —
+    dial movement is freely staged (the numbers update, the entry/table
+    reflect it) but nothing is sent to hardware — until the operator
+    explicitly presses ENGAGE. While engaged, dial commits apply live;
+    pressing STOP immediately kills output on every pair this window has
+    touched and disengages again, requiring another explicit ENGAGE push
+    before anything can move the array again.
+    """
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._app = app
+        self.title("Manual Mode — Frequency / Amplitude Tuning")
+        self.configure(bg=BG)
+        self.minsize(620, 620)
+        self.resizable(True, True)
+
+        self._dials = {}       # key -> DialControl
+        self._row_labels = []  # per-pair [freq_lbl, amp_lbl, status_lbl]
+        self._touched_pairs = set()   # pair indices freerun-applied here — see _on_close()
+        self._engaged = False  # interlock state — see class docstring
+
+        app._set_array_controls_locked(True)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._build_ui()
+        stateBus.subscribe(self._on_hw_event)
+        self._load_selection()
+
+    # ── UI construction ───────────────────────────────────────────────────
+
+    def _build_ui(self):
+        warn = tk.Label(self, bg=BG, fg=YELLOW, font=("Helvetica", 8, "italic"),
+                 text="Manual Mode owns the array — per-pair and ring/global "
+                      "controls on the main window are locked while this is open.",
+                 wraplength=580, justify="left")
+        warn.pack(fill="x", padx=10, pady=(8, 4))
+
+        interlock_frame = tk.LabelFrame(self, text="Output Interlock", bg=BG, fg=FG,
+                                        font=("Helvetica", 9, "bold"), padx=8, pady=6)
+        interlock_frame.pack(fill="x", padx=10, pady=4)
+        self._interlock_lbl = tk.Label(interlock_frame, text="● STOPPED", bg=BG, fg=RED,
+                                       font=("Helvetica", 11, "bold"))
+        self._interlock_lbl.pack(side="left")
+        self._stop_btn = tk.Button(
+            interlock_frame, text="STOP", bg=BG_HL, fg=RED, relief="flat",
+            padx=16, pady=4, font=("Helvetica", 9, "bold"),
+            activebackground=RED, activeforeground=BG,
+            command=self._stop)
+        self._stop_btn.pack(side="right", padx=(6, 0))
+        self._engage_btn = tk.Button(
+            interlock_frame, text="ENGAGE", bg=BG_HL, fg=GREEN, relief="flat",
+            padx=16, pady=4, font=("Helvetica", 9, "bold"),
+            activebackground=GREEN, activeforeground=BG,
+            command=self._engage)
+        self._engage_btn.pack(side="right")
+
+        sel_frame = tk.LabelFrame(self, text="Target", bg=BG, fg=FG,
+                                  font=("Helvetica", 9, "bold"), padx=8, pady=6)
+        sel_frame.pack(fill="x", padx=10, pady=4)
+        tk.Label(sel_frame, text="Apply to:", bg=BG, fg=FG,
+                 font=("Helvetica", 9)).pack(side="left")
+        self._targets = ["Global (All Channels)"] + [
+            f"Pair {p + 1} (Card {CHANNEL_MAP[p][0] + 1} Ch {CHANNEL_MAP[p][1]})"
+            for p in range(NUM_PAIRS)
+        ]
+        self._target_var = tk.StringVar(value=self._targets[0])
+        target_box = ttk.Combobox(sel_frame, textvariable=self._target_var,
+                                  values=self._targets, state="readonly", width=32)
+        target_box.pack(side="left", padx=(6, 0))
+        target_box.bind("<<ComboboxSelected>>", lambda _e: self._load_selection())
+
+        dial_frame = tk.LabelFrame(self, text="Controls", bg=BG, fg=FG,
+                                   font=("Helvetica", 9, "bold"), padx=10, pady=8)
+        dial_frame.pack(fill="x", padx=10, pady=4)
+        for key, label, lo, hi, default, fmt, fine_span in MANUAL_PARAMS:
+            dial = DialControl(dial_frame, label, lo, hi, default, fmt, fine_span,
+                               on_commit=lambda val, k=key: self._commit(k, val))
+            dial.pack(fill="x", pady=(0, 10))
+            self._dials[key] = dial
+
+        table_frame = tk.LabelFrame(self, text="Array Configuration", bg=BG, fg=FG,
+                                    font=("Helvetica", 9, "bold"), padx=6, pady=4)
+        table_frame.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+
+        headers = ["Pair", "Card/Ch", "Freq (Hz)", "Amp (V)", "Offset (V)", "Status"]
+        for col, h in enumerate(headers):
+            tk.Label(table_frame, text=h, bg=BG_HL, fg=FG_DIM,
+                     font=("Helvetica", 8, "bold"), padx=6, pady=2,
+                     relief="flat").grid(row=0, column=col, sticky="ew", padx=1, pady=1)
+
+        for p in range(NUM_PAIRS):
+            card_idx, ch_num = CHANNEL_MAP[p]
+            bg = BG_ALT if p % 2 else BG
+            vals = [str(p + 1), f"Card {card_idx + 1} Ch {ch_num}", "—", "—", "—", "IDLE"]
+            row = []
+            for col, val in enumerate(vals):
+                fg = PAIR_COLORS[p] if col == 0 else FG
+                lbl = tk.Label(table_frame, text=val, bg=bg, fg=fg,
+                               font=("Courier", 8), padx=6, pady=2, relief="flat")
+                lbl.grid(row=p + 1, column=col, sticky="ew", padx=1, pady=1)
+                row.append(lbl)
+            self._row_labels.append(row)
+
+        # Seed the table from whatever's already commanded.
+        for p in range(NUM_PAIRS):
+            state = pxiChannelState[p]
+            if state is not None:
+                self._update_row(p, state["freq"], state["amp"],
+                                 state["offset"], state["status"])
+
+        tk.Button(self, text="Close", bg=BG_HL, fg=FG, relief="flat",
+                  padx=12, pady=4, activebackground="#4e4e70", activeforeground=FG,
+                  command=self._on_close).pack(pady=(0, 8))
+
+        self._update_interlock_ui()
+
+    # ── interlock ─────────────────────────────────────────────────────────
+
+    def _engage(self):
+        """Push the interlock to ENGAGED and immediately apply whatever the
+        dials are currently showing to the current target(s) — so pressing
+        ENGAGE always starts output matching what's on screen, not
+        whatever was last live before STOP was pressed."""
+        if self._engaged:
+            return
+        self._engaged = True
+        self._update_interlock_ui()
+        self._push_current_dials_to_targets()
+        logMsg("INFO", "Manual Mode: ENGAGED — outputs live")
+
+    def _stop(self):
+        """Push the interlock to STOPPED and immediately kill output on
+        every pair this window has touched. Dial movement keeps working
+        afterward (staging only) until ENGAGE is pressed again."""
+        if not self._engaged:
+            return
+        self._engaged = False
+        self._update_interlock_ui()
+        for idx in sorted(self._touched_pairs):
+            ctrl = self._app._pair_controls[idx]
+            if not ctrl.is_disabled():
+                queuePxiStopPair(idx)
+        logMsg("INFO", "Manual Mode: STOPPED — outputs disengaged")
+
+    def _update_interlock_ui(self):
+        if self._engaged:
+            self._interlock_lbl.config(text="● ENGAGED", fg=GREEN)
+            self._engage_btn.configure(state="disabled")
+            self._stop_btn.configure(state="normal")
+        else:
+            self._interlock_lbl.config(text="● STOPPED", fg=RED)
+            self._engage_btn.configure(state="normal")
+            self._stop_btn.configure(state="disabled")
+
+    # ── target selection ──────────────────────────────────────────────────
+
+    def _selected_pair(self):
+        """Returns a pair_idx, or None if 'Global' is selected."""
+        idx = self._targets.index(self._target_var.get())
+        return None if idx == 0 else idx - 1
+
+    def _current_targets(self):
+        pair_idx = self._selected_pair()
+        return list(range(NUM_PAIRS)) if pair_idx is None else [pair_idx]
+
+    def _load_selection(self):
+        """Reflect the selected target's current freq/amp onto the dials
+        without firing a commit — this is just loading state, not a change.
+        If the interlock is already ENGAGED, also re-affirm the new target
+        live at those values (so switching targets while engaged doesn't
+        silently leave the newly-selected pair un-driven)."""
+        pair_idx = self._selected_pair()
+        if pair_idx is None:
+            # Global: show the first enabled pair's values as a representative
+            # starting point (there is no single "the" value across an array
+            # that may be individually configured).
+            source = next((c for c in self._app._pair_controls if not c.is_disabled()),
+                          self._app._pair_controls[0] if self._app._pair_controls else None)
+        else:
+            source = self._app._pair_controls[pair_idx]
+        if source is None:
+            return
+        freq, amp, offset, _phase, _ring, _disabled = source.get_values()
+        self._dials["freq"].set_absolute(freq, notify=False)
+        self._dials["amp"].set_absolute(amp, notify=False)
+        self._dials["offset"].set_absolute(offset, notify=False)
+        if self._engaged:
+            self._push_current_dials_to_targets()
+
+    # ── committing changes ────────────────────────────────────────────────
+
+    def _push_current_dials_to_targets(self):
+        """Apply whatever the freq/amp/offset dials currently show to every
+        pair in the current target set, with freerun=True (CONT trigger
+        mode — see pxi_worker's docstring). Used by ENGAGE and by target
+        switches that happen while already engaged."""
+        freq = self._dials["freq"].get()
+        amp = self._dials["amp"].get()
+        offset = self._dials["offset"].get()
+        for idx in self._current_targets():
+            ctrl = self._app._pair_controls[idx]
+            if ctrl.is_disabled():
+                continue
+            ctrl.apply_param("freq", freq)
+            ctrl.apply_param("amp", amp)
+            ctrl.apply_param("offset", offset)
+            ctrl.apply(freerun=True)
+            self._touched_pairs.add(idx)
+
+    def _commit(self, key, val):
+        """Fired (debounced) from a DialControl — always stages the new
+        value onto the target PairControls(es); only actually pushed to
+        hardware (freerun=True, CONT trigger mode — see pxi_worker's
+        docstring) while the interlock is ENGAGED. While STOPPED, this just
+        updates the dial/entry display so the operator can dial in values
+        before committing to output. Every pair touched while engaged is
+        remembered in self._touched_pairs so _on_close()/STOP can restore/
+        kill it correctly."""
+        for idx in self._current_targets():
+            ctrl = self._app._pair_controls[idx]
+            if ctrl.is_disabled():
+                continue
+            ctrl.apply_param(key, val)
+            if self._engaged:
+                ctrl.apply(freerun=True)
+                self._touched_pairs.add(idx)
+
+    # ── live table updates ────────────────────────────────────────────────
+
+    def _on_hw_event(self, event, data):
+        if event != "channel_update":
+            return
+        self.after(0, self._apply_hw_event, data)
+
+    def _apply_hw_event(self, data):
+        if not self.winfo_exists():
+            return
+        p = data.get("pair", 0)
+        self._update_row(p, data.get("freq", 0.0), data.get("amp", 0.0),
+                         data.get("offset", 0.0), data.get("status", "IDLE"))
+
+    def _update_row(self, pair_idx, freq, amp, offset, status):
+        if not (0 <= pair_idx < len(self._row_labels)):
+            return
+        row = self._row_labels[pair_idx]
+        row[2].config(text=f"{freq:.0f}")
+        row[3].config(text=f"{amp:.3f}")
+        row[4].config(text=f"{offset:.3f}")
+        status_fg = {"RUNNING": GREEN, "NOT_UPDATED": YELLOW}.get(status, FG_DIM)
+        row[5].config(text=status, fg=status_fg)
+
+    # ── shutdown ──────────────────────────────────────────────────────────
+
+    def _on_close(self):
+        """If still ENGAGED, restore normal (POSEDGE, trigger-gated)
+        operation on every pair Manual Mode put into CONT/free-run mode —
+        re-applies each one through the ordinary path (freerun=False) using
+        whatever values are currently staged on its PairControls, so the
+        array comes back out of Manual Mode exactly as it would from a
+        normal Apply. If STOPPED, those pairs are already off — closing
+        the window shouldn't resurrect output the operator just killed, so
+        nothing further is sent."""
+        if self._engaged:
+            for idx in sorted(self._touched_pairs):
+                ctrl = self._app._pair_controls[idx]
+                if not ctrl.is_disabled():
+                    ctrl.apply(freerun=False)
+        self._app._set_array_controls_locked(False)
+        self.destroy()
+
+
+class SweepModeWindow(tk.Toplevel):
+    """Standalone window for driving one or all pairs through a
+    trigger-gated frequency sweep (card.generateSweep() instead of
+    generateSignal()) — for exciting a resonance/dispersion scan across a
+    frequency band rather than dialing in one fixed tone.
+
+    Unlike ManualModeWindow, every armed channel here is POSEDGE/FRONT-
+    trigger-gated exactly like a normal main-window Apply: Arm configures
+    and calls outputOn() but nothing actually starts sweeping until the
+    relay trigger fires, so all armed channels start their sweep in lockstep
+    off the shared trigger line. This window therefore also owns a copy of
+    the main window's Fire Trigger control (same "fire_relay" queue command)
+    rather than needing its own free-run interlock.
+
+    Opening this window locks the main window's per-pair and ring/global
+    controls (via app._set_array_controls_locked), same as Manual Mode —
+    the two can't be allowed to fight over the same channels.
+    """
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._app = app
+        self.title("Sweep Mode — Frequency Sweep Tuning")
+        self.configure(bg=BG)
+        self.minsize(640, 640)
+        self.resizable(True, True)
+
+        self._dials = {}       # key -> DialControl
+        self._row_labels = []  # per-pair [freq_lbl, amp_lbl, offset_lbl, status_lbl]
+        self._touched_pairs = set()   # pair indices armed here — see _on_close()
+
+        app._set_array_controls_locked(True)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._build_ui()
+        stateBus.subscribe(self._on_hw_event)
+
+    # ── UI construction ───────────────────────────────────────────────────
+
+    def _build_ui(self):
+        warn = tk.Label(self, bg=BG, fg=YELLOW, font=("Helvetica", 8, "italic"),
+                 text="Sweep Mode owns the array — per-pair and ring/global "
+                      "controls on the main window are locked while this is open. "
+                      "Arm stages the sweep and waits on the trigger; Fire Trigger "
+                      "starts every armed channel sweeping in sync.",
+                 wraplength=600, justify="left")
+        warn.pack(fill="x", padx=10, pady=(8, 4))
+
+        sel_frame = tk.LabelFrame(self, text="Target", bg=BG, fg=FG,
+                                  font=("Helvetica", 9, "bold"), padx=8, pady=6)
+        sel_frame.pack(fill="x", padx=10, pady=4)
+        tk.Label(sel_frame, text="Apply to:", bg=BG, fg=FG,
+                 font=("Helvetica", 9)).pack(side="left")
+        self._targets = ["Global (All Channels)"] + [
+            f"Pair {p + 1} (Card {CHANNEL_MAP[p][0] + 1} Ch {CHANNEL_MAP[p][1]})"
+            for p in range(NUM_PAIRS)
+        ]
+        self._target_var = tk.StringVar(value=self._targets[0])
+        target_box = ttk.Combobox(sel_frame, textvariable=self._target_var,
+                                  values=self._targets, state="readonly", width=32)
+        target_box.pack(side="left", padx=(6, 0))
+
+        dial_frame = tk.LabelFrame(self, text="Sweep Controls", bg=BG, fg=FG,
+                                   font=("Helvetica", 9, "bold"), padx=10, pady=8)
+        dial_frame.pack(fill="x", padx=10, pady=4)
+        for key, label, lo, hi, default, fmt, fine_span in SWEEP_PARAMS:
+            dial = DialControl(dial_frame, label, lo, hi, default, fmt, fine_span,
+                               on_commit=None)
+            dial.pack(fill="x", pady=(0, 10))
+            self._dials[key] = dial
+
+        action = tk.Frame(self, bg=BG)
+        action.pack(fill="x", padx=10, pady=(0, 4))
+        tk.Button(action, text="Arm", bg=BG_HL, fg=GREEN, relief="flat",
+                  padx=12, pady=5, font=("Helvetica", 9, "bold"),
+                  activebackground=GREEN, activeforeground=BG,
+                  command=self._arm).pack(side="left", padx=(0, 10))
+        tk.Button(action, text="Fire Trigger", bg=BG_HL, fg=YELLOW, relief="flat",
+                  padx=12, pady=5, font=("Helvetica", 9, "bold"),
+                  activebackground=YELLOW, activeforeground=BG,
+                  command=self._fire_relay).pack(side="left", padx=(0, 10))
+        tk.Button(action, text="Stop", bg=BG_HL, fg=RED, relief="flat",
+                  padx=12, pady=5, font=("Helvetica", 9, "bold"),
+                  activebackground=RED, activeforeground=BG,
+                  command=self._stop).pack(side="left", padx=(0, 10))
+
+        table_frame = tk.LabelFrame(self, text="Array Configuration", bg=BG, fg=FG,
+                                    font=("Helvetica", 9, "bold"), padx=6, pady=4)
+        table_frame.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+
+        headers = ["Pair", "Card/Ch", "Start Freq (Hz)", "Amp (V)", "Offset (V)", "Status"]
+        for col, h in enumerate(headers):
+            tk.Label(table_frame, text=h, bg=BG_HL, fg=FG_DIM,
+                     font=("Helvetica", 8, "bold"), padx=6, pady=2,
+                     relief="flat").grid(row=0, column=col, sticky="ew", padx=1, pady=1)
+
+        for p in range(NUM_PAIRS):
+            card_idx, ch_num = CHANNEL_MAP[p]
+            bg = BG_ALT if p % 2 else BG
+            vals = [str(p + 1), f"Card {card_idx + 1} Ch {ch_num}", "—", "—", "—", "IDLE"]
+            row = []
+            for col, val in enumerate(vals):
+                fg = PAIR_COLORS[p] if col == 0 else FG
+                lbl = tk.Label(table_frame, text=val, bg=bg, fg=fg,
+                               font=("Courier", 8), padx=6, pady=2, relief="flat")
+                lbl.grid(row=p + 1, column=col, sticky="ew", padx=1, pady=1)
+                row.append(lbl)
+            self._row_labels.append(row)
+
+        # Seed the table from whatever's already commanded.
+        for p in range(NUM_PAIRS):
+            state = pxiChannelState[p]
+            if state is not None:
+                self._update_row(p, state["freq"], state["amp"],
+                                 state["offset"], state["status"])
+
+        tk.Button(self, text="Close", bg=BG_HL, fg=FG, relief="flat",
+                  padx=12, pady=4, activebackground="#4e4e70", activeforeground=FG,
+                  command=self._on_close).pack(pady=(0, 8))
+
+    # ── target selection ──────────────────────────────────────────────────
+
+    def _selected_pair(self):
+        """Returns a pair_idx, or None if 'Global' is selected."""
+        idx = self._targets.index(self._target_var.get())
+        return None if idx == 0 else idx - 1
+
+    def _current_targets(self):
+        pair_idx = self._selected_pair()
+        return list(range(NUM_PAIRS)) if pair_idx is None else [pair_idx]
+
+    # ── arm / trigger / stop ──────────────────────────────────────────────
+
+    def _arm(self):
+        """Stage the current dial values onto every pair in the current
+        target set and arm it (POSEDGE/FRONT trigger, outputOn()) — nothing
+        actually starts sweeping until Fire Trigger closes the relay."""
+        minFreq = self._dials["minFreq"].get()
+        maxFreq = self._dials["maxFreq"].get()
+        rate = self._dials["rate"].get()
+        amp = self._dials["amp"].get()
+        offset = self._dials["offset"].get()
+        if maxFreq < minFreq:
+            logMsg("WARNING", "Sweep Mode: max frequency is below min frequency — swap them")
+            return
+        for idx in self._current_targets():
+            ctrl = self._app._pair_controls[idx]
+            if ctrl.is_disabled():
+                continue
+            queuePxiApplySweep(idx, minFreq, maxFreq, rate, amp, offset)
+            self._touched_pairs.add(idx)
+        logMsg("INFO",
+            f"Sweep Mode: armed {minFreq:.0f}-{maxFreq:.0f}Hz @ {rate:.0f}Hz/s "
+            f"on {'all channels' if self._selected_pair() is None else f'pair {self._selected_pair()+1}'}")
+
+    def _fire_relay(self):
+        pxiQueue.put(("fire_relay",))
+
+    def _stop(self):
+        """Immediately kill output on every pair this window has armed."""
+        for idx in sorted(self._touched_pairs):
+            ctrl = self._app._pair_controls[idx]
+            if not ctrl.is_disabled():
+                queuePxiStopPair(idx)
+        logMsg("INFO", "Sweep Mode: stopped")
+
+    # ── live table updates ────────────────────────────────────────────────
+
+    def _on_hw_event(self, event, data):
+        if event != "channel_update":
+            return
+        self.after(0, self._apply_hw_event, data)
+
+    def _apply_hw_event(self, data):
+        if not self.winfo_exists():
+            return
+        p = data.get("pair", 0)
+        self._update_row(p, data.get("freq", 0.0), data.get("amp", 0.0),
+                         data.get("offset", 0.0), data.get("status", "IDLE"))
+
+    def _update_row(self, pair_idx, freq, amp, offset, status):
+        if not (0 <= pair_idx < len(self._row_labels)):
+            return
+        row = self._row_labels[pair_idx]
+        row[2].config(text=f"{freq:.0f}")
+        row[3].config(text=f"{amp:.3f}")
+        row[4].config(text=f"{offset:.3f}")
+        status_fg = {"RUNNING": GREEN, "NOT_UPDATED": YELLOW}.get(status, FG_DIM)
+        row[5].config(text=status, fg=status_fg)
+
+    # ── shutdown ──────────────────────────────────────────────────────────
+
+    def _on_close(self):
+        """Turns off every pair this window armed, then restores each back
+        to whatever its PairControls currently show (ordinary fixed-tone
+        Apply, freerun=False) — mirrors ManualModeWindow's restore-on-close
+        behavior so Sweep Mode never leaves a channel sweeping or silently
+        stuck armed after the window closes."""
+        for idx in sorted(self._touched_pairs):
+            ctrl = self._app._pair_controls[idx]
+            if not ctrl.is_disabled():
+                queuePxiStopPair(idx)
+                ctrl.apply(freerun=False)
+        self._app._set_array_controls_locked(False)
+        self.destroy()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN APPLICATION
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1666,6 +2653,13 @@ class GroundControllerApp(tk.Tk):
             tk.Frame(scroll.inner, bg=BG_HL, height=1).pack(fill="x")
             self._pair_controls.append(ctrl)
 
+        # Ring / global controls
+        ring_frame = tk.LabelFrame(content, text="Ring / Global Controls",
+                                   bg=BG, fg=FG, font=("Helvetica", 9, "bold"),
+                                   padx=8, pady=4)
+        ring_frame.pack(fill="x", padx=10, pady=4)
+        self._build_ring_panel(ring_frame)
+
         # Ground config save/load bar
         cfg_frame = tk.LabelFrame(content, text="Ground Configs",
                                   bg=BG, fg=FG, font=("Helvetica", 9, "bold"),
@@ -1697,27 +2691,27 @@ class GroundControllerApp(tk.Tk):
         # Action bar
         action = tk.Frame(content, bg=BG)
         action.pack(fill="x", padx=10, pady=(0, 4))
-        for label, cmd in [("Apply All Pairs", self._apply_all)]:
-            tk.Button(action, text=label, bg=BG_HL, fg=FG, relief="flat",
-                      padx=12, pady=5,
-                      activebackground="#4e4e70", activeforeground=FG,
-                      command=cmd).pack(side="left", padx=(0, 10))
-        # Arm/Trigger/Stop drive pxiHeader.armFuncGens()/triggerFuncGens()/
-        # disarmFuncGens() — all 6 channels together, since triggering fires
-        # the shared relay once for every armed channel (that's what keeps
-        # their phases synchronized). "Apply All Pairs" only stages config.
-        tk.Button(action, text="Arm", bg=BG_HL, fg=YELLOW, relief="flat",
-                  padx=12, pady=5,
-                  activebackground=YELLOW, activeforeground=BG,
-                  command=self._arm_all).pack(side="left", padx=(0, 10))
-        tk.Button(action, text="Trigger", bg=BG_HL, fg=GREEN, relief="flat",
-                  padx=12, pady=5,
-                  activebackground=GREEN, activeforeground=BG,
-                  command=self._trigger_all).pack(side="left", padx=(0, 10))
+        self._apply_all_btn = tk.Button(
+            action, text="Apply All Pairs", bg=BG_HL, fg=FG, relief="flat",
+            padx=12, pady=5,
+            activebackground="#4e4e70", activeforeground=FG,
+            command=self._apply_all)
+        self._apply_all_btn.pack(side="left", padx=(0, 10))
+        # "Apply All Pairs" configures every pair's channel and calls
+        # outputOn() immediately (see pxi_worker's docstring) — there is no
+        # separate arm/trigger step. "Stop All" is the one global kill switch.
         tk.Button(action, text="Stop All", bg=BG_HL, fg=RED, relief="flat",
                   padx=12, pady=5,
                   activebackground=RED, activeforeground=BG,
                   command=self._stop_all).pack(side="left", padx=(0, 10))
+        # Fires the 40-115 relay's trigger pulse only — does not touch any
+        # channel's config/output. Channels must already be armed (Apply
+        # calls outputOn()) and waiting on the external FRONT trigger for
+        # this to actually start them generating.
+        tk.Button(action, text="Fire Trigger", bg=BG_HL, fg=YELLOW, relief="flat",
+                  padx=12, pady=5,
+                  activebackground=YELLOW, activeforeground=BG,
+                  command=self._fire_relay).pack(side="left", padx=(0, 10))
         tk.Button(action, text="LXI Manager…", bg=BG_HL, fg=BLUE, relief="flat",
                   padx=12, pady=5,
                   activebackground=BLUE, activeforeground=BG,
@@ -1726,6 +2720,14 @@ class GroundControllerApp(tk.Tk):
                   padx=12, pady=5,
                   activebackground=YELLOW, activeforeground=BG,
                   command=self._open_relay_manager).pack(side="left", padx=(0, 10))
+        tk.Button(action, text="Manual Mode…", bg=BG_HL, fg=GREEN, relief="flat",
+                  padx=12, pady=5,
+                  activebackground=GREEN, activeforeground=BG,
+                  command=self._open_manual_mode).pack(side="left", padx=(0, 10))
+        tk.Button(action, text="Sweep Mode…", bg=BG_HL, fg=BLUE, relief="flat",
+                  padx=12, pady=5,
+                  activebackground=BLUE, activeforeground=BG,
+                  command=self._open_sweep_mode).pack(side="left", padx=(0, 10))
 
         # LXI channel table
         lxi_frame = tk.LabelFrame(content, text="LXI Function Generators",
@@ -1754,7 +2756,7 @@ class GroundControllerApp(tk.Tk):
             col = tk.Frame(f, bg=BG)
             col.pack(side="left", padx=14)
 
-            tk.Label(col, text=f"Relay {i}", fg=FG_DIM, bg=BG,
+            tk.Label(col, text=RELAY_NAMES[i], fg=FG_DIM, bg=BG,
                      font=("Helvetica", 8)).pack()
 
             ind = tk.Label(col, text="●", fg=RED, bg=BG, font=("Helvetica", 14))
@@ -1813,7 +2815,7 @@ class GroundControllerApp(tk.Tk):
         self._safe_mode_lbl.pack(side="right", padx=8)
 
     def _build_lxi_panel(self, parent):
-        headers = ["Pair", "Card", "Ch", "Type",
+        headers = ["Pair", "Card/Ch", "Type",
                    "Freq (Hz)", "Amp (V)", "Offset (V)", "Phase (°)", "Status"]
         for col, h in enumerate(headers):
             tk.Label(parent, text=h, bg=BG_HL, fg=FG_DIM,
@@ -1823,7 +2825,7 @@ class GroundControllerApp(tk.Tk):
 
         for p in range(NUM_PAIRS):
             card_idx, ch_num = CHANNEL_MAP[p]
-            row_defaults = [str(p + 1), str(card_idx), str(ch_num), "SINE",
+            row_defaults = [str(p + 1), f"Card {card_idx + 1} Ch {ch_num}", "SINE",
                             "—", "—", "—", "—", "IDLE"]
             row_labels = []
             for col, val in enumerate(row_defaults):
@@ -1834,6 +2836,55 @@ class GroundControllerApp(tk.Tk):
                 lbl.grid(row=p + 1, column=col, sticky="ew", padx=1, pady=1)
                 row_labels.append(lbl)
             self._lxi_labels.append(row_labels)
+
+    def _build_ring_panel(self, parent):
+        """Two convenience actions layered on top of the per-pair sliders —
+        neither is hardware-aware on its own; both just stage values onto
+        each PairControls (via apply_param()) and then call apply(), so the
+        result is identical to the operator setting those sliders by hand
+        and clicking Apply. Disabled pairs are skipped entirely (their
+        sliders are left untouched and no apply is sent)."""
+        freq_row = tk.Frame(parent, bg=BG)
+        freq_row.pack(fill="x", pady=(0, 6))
+        tk.Label(freq_row, text="Frequency (Hz) — all channels:", bg=BG, fg=FG,
+                 font=("Helvetica", 9)).pack(side="left")
+        self._global_freq_var = tk.StringVar(value="40000")
+        self._global_freq_entry = tk.Entry(freq_row, textvariable=self._global_freq_var, width=10,
+                 bg=BG_HL, fg=FG, insertbackground=FG,
+                 relief="flat", bd=2)
+        self._global_freq_entry.pack(side="left", padx=(6, 8))
+        self._global_freq_btn = tk.Button(freq_row, text="Apply to All", bg=BG_HL, fg=BLUE, relief="flat",
+                  padx=10, activebackground=BLUE, activeforeground=BG,
+                  command=self._apply_global_frequency)
+        self._global_freq_btn.pack(side="left")
+
+        ring_row = tk.Frame(parent, bg=BG)
+        ring_row.pack(fill="x")
+        tk.Label(ring_row, text="Inner Amp (V):", bg=BG, fg=FG,
+                 font=("Helvetica", 9)).pack(side="left")
+        self._inner_amp_var = tk.StringVar(value="10.0")
+        self._inner_amp_entry = tk.Entry(ring_row, textvariable=self._inner_amp_var, width=8,
+                 bg=BG_HL, fg=FG, insertbackground=FG,
+                 relief="flat", bd=2)
+        self._inner_amp_entry.pack(side="left", padx=(6, 14))
+        tk.Label(ring_row, text="Ratio (Outer/Inner):", bg=BG, fg=FG,
+                 font=("Helvetica", 9)).pack(side="left")
+        self._ratio_var = tk.StringVar(value="1.0")
+        self._ratio_entry = tk.Entry(ring_row, textvariable=self._ratio_var, width=8,
+                 bg=BG_HL, fg=FG, insertbackground=FG,
+                 relief="flat", bd=2)
+        self._ratio_entry.pack(side="left", padx=(6, 14))
+        tk.Label(ring_row, text="Phase Δ (Outer − Inner, °):", bg=BG, fg=FG,
+                 font=("Helvetica", 9)).pack(side="left")
+        self._phase_delta_var = tk.StringVar(value="0.0")
+        self._phase_delta_entry = tk.Entry(ring_row, textvariable=self._phase_delta_var, width=8,
+                 bg=BG_HL, fg=FG, insertbackground=FG,
+                 relief="flat", bd=2)
+        self._phase_delta_entry.pack(side="left", padx=(6, 14))
+        self._ring_settings_btn = tk.Button(ring_row, text="Apply Ring Settings", bg=BG_HL, fg=GREEN, relief="flat",
+                  padx=10, activebackground=GREEN, activeforeground=BG,
+                  command=self._apply_ring_settings)
+        self._ring_settings_btn.pack(side="left")
 
     # ── HARDWARE INIT ────────────────────────────────────────────────────────
 
@@ -1878,14 +2929,14 @@ class GroundControllerApp(tk.Tk):
             p = data.get("pair", 0)
             if 0 <= p < len(self._lxi_labels):
                 row = self._lxi_labels[p]
-                row[3].config(text=data.get("waveform", "SINE"))
-                row[4].config(text=f"{data['freq']:.0f}")
-                row[5].config(text=f"{data['amp']:.3f}")
-                row[6].config(text=f"{data['offset']:.3f}")
-                row[7].config(text=f"{data['phase']:.1f}")
+                row[2].config(text=data.get("waveform", "SINE"))
+                row[3].config(text=f"{data['freq']:.0f}")
+                row[4].config(text=f"{data['amp']:.3f}")
+                row[5].config(text=f"{data['offset']:.3f}")
+                row[6].config(text=f"{data['phase']:.1f}")
                 status = data.get("status", "IDLE")
-                status_fg = {"RUNNING": GREEN, "ARMED": YELLOW}.get(status, FG_DIM)
-                row[8].config(text=status, fg=status_fg)
+                status_fg = {"RUNNING": GREEN, "NOT_UPDATED": YELLOW}.get(status, FG_DIM)
+                row[7].config(text=status, fg=status_fg)
 
         elif event == "relay_update":
             i = data.get("relay", 0)
@@ -1907,14 +2958,49 @@ class GroundControllerApp(tk.Tk):
         for ctrl in self._pair_controls:
             ctrl.apply()
 
-    def _arm_all(self):
-        pxiQueue.put(("arm",))
-
-    def _trigger_all(self):
-        pxiQueue.put(("trigger",))
-
     def _stop_all(self):
-        pxiQueue.put(("stop_all",))
+        queuePxiStopAll()
+
+    def _fire_relay(self):
+        pxiQueue.put(("fire_relay",))
+
+    def _apply_global_frequency(self):
+        try:
+            freq = float(self._global_freq_var.get())
+        except ValueError:
+            logMsg("WARNING", "Global frequency: invalid number")
+            return
+        for ctrl in self._pair_controls:
+            if ctrl.is_disabled():
+                continue
+            ctrl.apply_param("freq", freq)
+            ctrl.apply()
+        logMsg("INFO", f"Global frequency: {freq:.0f} Hz applied to all enabled channels")
+
+    def _apply_ring_settings(self):
+        try:
+            inner_amp = float(self._inner_amp_var.get())
+            ratio = float(self._ratio_var.get())
+            phase_delta = float(self._phase_delta_var.get())
+        except ValueError:
+            logMsg("WARNING", "Ring settings: invalid number(s)")
+            return
+        outer_amp = inner_amp * ratio
+        inner_phase = 0.0
+        outer_phase = phase_delta % 360.0
+        for ctrl in self._pair_controls:
+            if ctrl.is_disabled():
+                continue
+            if ctrl.get_ring() == "Inner":
+                amp, phase = inner_amp, inner_phase
+            else:
+                amp, phase = outer_amp, outer_phase
+            ctrl.apply_param("amp", amp)
+            ctrl.apply_param("phase", phase)
+            ctrl.apply()
+        logMsg("INFO",
+            f"Ring settings applied: inner={inner_amp:.3f}V @ 0.0°, "
+            f"outer={outer_amp:.3f}V @ {outer_phase:.1f}°")
 
     def _refresh_config_dropdown(self):
         self._config_dropdown["values"] = listGroundConfigs()
@@ -1951,7 +3037,8 @@ class GroundControllerApp(tk.Tk):
             if pair_idx >= len(self._pair_controls):
                 break
             self._pair_controls[pair_idx].load_values(
-                row["frequency"], row["amplitude"], row["offset"], row["phase"])
+                row["frequency"], row["amplitude"], row["offset"], row["phase"],
+                row["ring"], row["disabled"])
         logMsg("INFO", f"Ground config '{name}' loaded and applied ({len(rows)} pair(s))")
 
     def _open_lxi_manager(self):
@@ -1969,6 +3056,38 @@ class GroundControllerApp(tk.Tk):
             _relayManagerWindow.focus_force()
         else:
             _relayManagerWindow = RelayManagerWindow(self)
+
+    def _open_manual_mode(self):
+        global _manualModeWindow
+        if _manualModeWindow is not None and _manualModeWindow.winfo_exists():
+            _manualModeWindow.lift()
+            _manualModeWindow.focus_force()
+        else:
+            _manualModeWindow = ManualModeWindow(self)
+
+    def _open_sweep_mode(self):
+        global _sweepModeWindow
+        if _sweepModeWindow is not None and _sweepModeWindow.winfo_exists():
+            _sweepModeWindow.lift()
+            _sweepModeWindow.focus_force()
+        else:
+            _sweepModeWindow = SweepModeWindow(self)
+
+    def _set_array_controls_locked(self, locked):
+        """Grey out (without stopping) every per-pair and ring/global control
+        while Manual Mode owns the array — Stop All / Fire Trigger / LXI &
+        Relay Manager stay usable as safety/diagnostic escape hatches (see
+        AskUserQuestion decision: 'lock only per-pair controls')."""
+        for ctrl in self._pair_controls:
+            ctrl.set_locked(locked)
+        state = "disabled" if locked else "normal"
+        self._apply_all_btn.configure(state=state)
+        self._global_freq_entry.configure(state=state)
+        self._global_freq_btn.configure(state=state)
+        self._inner_amp_entry.configure(state=state)
+        self._ratio_entry.configure(state=state)
+        self._phase_delta_entry.configure(state=state)
+        self._ring_settings_btn.configure(state=state)
 
     def _toggle_relay(self, relay_idx, state):
         relayQueue.put(("set", relay_idx, state))

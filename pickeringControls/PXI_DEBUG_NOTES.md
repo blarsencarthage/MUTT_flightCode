@@ -350,3 +350,151 @@ chassis firmware) actually needs the reset.
 - `pickeringControls/pilxi-5.7/pi620lx/__init__.py` — **not** touched;
   `revisionQuery()`'s missing-`.value` bug (section 8a) was deliberately left
   in place per vendor-code-hands-off policy.
+
+## 9. Update 2026-07-27 (later same day): arm/trigger free-run regression + new frequency regression, wiring ruled out, no recoverable earlier-version history
+
+**Reported symptom (start of session):** the stage → arm → trigger workflow
+(`sendConfigToCards()` → `armFuncGens()` → `triggerFuncGens()`, see
+`pickeringInterfaceV2_README.md`) used to work as intended — channels stayed
+silent until the external 5V trigger arrived. At some point during ongoing
+modifications this regressed: channels now start generating the instant
+config is loaded, armed, or triggered, regardless of whether the external 5V
+signal is actually present.
+
+**Investigation, in order:**
+
+1. **Compared call order against the vendor's own reference example**
+   (`pickeringControls/py620_v0.1/Examples/Example_SimpleGenerate.py`), which
+   calls `card.setTriggerMode(...)` *before* `card.generateSignal(...,
+   generate=False)`. The current code (`sendConfigToCards()` /
+   `armFuncGens()`) sets trigger mode *after* `generateSignal()`, in a
+   separate, later method call. Hypothesized `PI620LX_GenerateSignalEx`
+   latches trigger behavior at call time, so the late `setTriggerMode()` call
+   would have no effect.
+2. **Tried the reorder** — moved `setTriggerMode(FRONT, POSEDGE)` into
+   `sendConfigToCards()`, before `generateSignal()`. **Result: made things
+   worse.** Free-run behavior was **unchanged** (still starts regardless of
+   trigger), and a **new regression appeared**: all channels' output
+   frequency locked to ~2.5kHz on the scope regardless of the configured
+   value (tried 10kHz, 25kHz, 40kHz, 100kHz — all read ~2.5kHz). **Reverted**
+   back to the original order (trigger mode set in `armFuncGens()`, after
+   `generateSignal()`) — this is the state the file is in now, matching what
+   was committed in `59c1f1b` (the only commit that has ever touched
+   `pickeringInterfaceV2.py`, checked across all branches/reflog/stash — see
+   below).
+3. **Checked ground logs** (`ground_2026-07-27_14-56-14.log` through
+   `_15-19-37.log`) — the *software* staged→armed→triggered sequence logs
+   exactly as expected every time; no evidence of a duplicate/spurious
+   `armFuncGens()`/`outputOn()` call from the log alone. Also noted (not
+   directly relevant to this bug, logged for completeness): `COM3`
+   (`SERIAL_PORT`, spacecraft serial) and `COM5` (`RELAY_PORT`, separate
+   relay controller — not the Pickering 40-115 relay card) never connected in
+   any of these sessions, consistent with a PXI-only bench session with that
+   hardware unplugged; and the LXI cabinet took ~2m18s to accept a connection
+   in one session, consistent with the existing boot-time TODO at the top of
+   `pickeringInterfaceV2.py`.
+4. **Proposed a wiring-mixup hypothesis** (TRIGGER vs CLOCK SMB swapped on
+   the 41-620 front panel — see `Pickering_FuncGenManual.pdf` §1/§2, though
+   note that PDF is for the 41-620A, not necessarily the exact card model in
+   this chassis) as a single explanation for both symptoms together (floating
+   trigger input reading as a spurious edge; wrong/absent reference clock
+   explaining a fixed low output frequency). **User confirmed on physical
+   inspection: trigger lines and channel lines are wired correctly.** This
+   theory is ruled out.
+5. **Searched for the "earlier version that worked"** the user described —
+   checked `git log --all -- pickeringControls/pickeringInterfaceV2.py`
+   (single commit `59c1f1b`, everywhere), reflog, stash, and the other two
+   branches (`advTechVersion`, `owenExp` — neither has a `pickeringInterfaceV2.py`
+   at all, only the old `pickeringInterface.py` v1). **Conclusion: no
+   recoverable earlier version of this file exists anywhere in this repo's
+   history.** Whatever the working version looked like was never committed.
+   The user believes it was a previous commit but wasn't sure which — worth
+   revisiting if a specific commit/backup surfaces later, but nothing further
+   to search for in this repo as of this writing.
+
+**Current state:** `pickeringInterfaceV2.py` is back to its original
+(`59c1f1b`) call order — known to at least produce correct frequency when
+manually verified in isolation (matches the vendor example / v1 /
+`claudeController.py`, all of which use this same
+configure→triggerMode→generateSignal→outputOn shape, differing only in using
+`CONT` instead of `POSEDGE`). The free-run-regardless-of-trigger bug is
+**still unresolved** and, with wiring ruled out and no code diff available,
+its root cause is unconfirmed — could be a genuine pi620lx/firmware quirk
+around `POSEDGE` trigger mode on this card, or something specific to how
+`groundController.py`'s threaded `pxi_worker`/queue drives the class
+differently than a direct call (untested).
+
+**Diagnostic added, not yet run:** `pickeringControls/diag_arm_trigger.py` —
+standalone script that drives `pickeringHeader` directly (bypasses
+groundController's threads/queue/heartbeat entirely) on a single channel,
+with manual `input()` pauses at 4 checkpoints (configured/output-off →
+trigger-mode-set/still-off → `outputOn()`-called/before-any-trigger-pulse →
+after-trigger-pulse), so a scope can confirm at each step whether the
+channel is running and at what frequency. Designed to separate two
+possibilities: (a) `POSEDGE` genuinely doesn't gate `outputOn()` on this
+hardware/driver (free-runs the moment `outputOn()` is called, step 3), vs.
+(b) something specific to the full `groundController.py` app path causes an
+extra/early trigger. **Next step: user will run this tomorrow** (2026-07-28)
+and report the 4 checkpoint observations (running yes/no + frequency at
+each).
+
+### Files touched 2026-07-27 (section 9)
+
+- `pickeringControls/pickeringInterfaceV2.py` — trigger-mode-ordering change
+  tried and reverted; net no change from `59c1f1b`.
+- `pickeringControls/pickeringInterfaceV2_README.md` — same, tried and
+  reverted.
+
+## 10. Update 2026-07-30: "missing DC offset" was a scope setting, not a bug; amplitude gap traced to a wrong full-scale constant
+
+**Reported symptom:** running via the GUI/bench scripts with 5V amplitude +
+4.5V offset at 10kHz, the scope showed a ~2.8V amplitude sine wave with no
+DC offset at all.
+
+**Offset — false alarm, resolved.** Wrote `pickeringControls/diag_offset_amplitude.py`
+(raw `pilxi`/`pi620lx` calls, no `pickeringHeader`, same call order as
+`pickeringConnector.py`: `setActiveChannel` → `outputOff` → `setTriggerMode`
+→ `setOutputOffsetVoltage` → `setAttenuation` → `generateSignal(generate=False)`
+→ `outputOn`, CONT trigger so no relay pulse needed) to isolate amplitude/
+offset from the arm/trigger bug in section 9. Steps 1-3 (offset=0V; offset=
+4.5V/connect=True; offset=4.5V/connect=False) all produced the *identical*
+2.64Vpp/10kHz signal with no DC shift in any case — ruling out an
+amplitude-headroom-clamp theory, since connect=False should have differed
+from connect=True if the commanded offset value alone affected the output.
+Root cause: **the oscilloscope channel was set to AC coupling**, which
+blocks DC entirely regardless of what the function generator outputs.
+Switching the channel to DC coupling fixed it immediately — the offset was
+present on the signal the whole time. No code or driver bug here. (Step 4's
+raw `setOutputOffsetDacCode()` sweep also showed the driver rejecting any
+code above 0 — `16384`/`32768`/`49152`/`65535` all raised "Invalid value
+passed to parameter 3" — so the valid raw-code range is much narrower than
+the assumed 16-bit 0-65535; not investigated further since the volts-based
+call is what's actually used in the app and coupling explained the symptom.)
+
+**Amplitude gap — root cause found: wrong full-scale constant, not a
+hardware fault.** `groundController.py:46` defines
+`_FULL_SCALE_VOLTS = 20.0` with a comment claiming "Full-scale output is
+20 Vpp." `Pickering_FuncGenManual.pdf` Section 1's spec table says
+otherwise: `Waveform Signal: 10V pk to pk, open circuit load` — the card's
+actual full-scale is **10Vpp**, not 20Vpp. `_dbFromVolts()` computes
+attenuation as `20*log10(_FULL_SCALE_VOLTS / volts)`; using 20V instead of
+the correct 10V computes double the attenuation dB needed for any target
+voltage, so every commanded amplitude comes out near **half** of what was
+requested. Checking the reported numbers: requesting 5V against the wrong
+20V reference computes 12.04dB attenuation; applying that same dB against
+the manual's correct 10V full scale gives 10 × 10^(-12.04/20) ≈ 2.5Vpp —
+closely matching the measured 2.64Vpp (small residual gap plausibly
+probe/loading related, worth re-checking once the constant is fixed). This
+constant (and its "20Vpp" comment) is duplicated across
+`groundController.py`, `pickeringControls/PI620LX_QUICK_REFERENCE.md`, and
+`pickeringControls/diag_offset_amplitude.py` — all copied from the same
+wrong assumption. **Not yet fixed in code** — flagged here pending a
+decision on whether to correct `_FULL_SCALE_VOLTS` to 10.0 everywhere.
+
+### Files touched 2026-07-30 (section 10)
+
+- `pickeringControls/diag_offset_amplitude.py` — new standalone diagnostic
+  script (raw pilxi/pi620lx, no pickeringHeader), used to isolate and rule
+  out the offset/amplitude symptom from the trigger bug.
+- `pickeringControls/diag_arm_trigger.py` — new standalone diagnostic script,
+  not yet run against hardware.

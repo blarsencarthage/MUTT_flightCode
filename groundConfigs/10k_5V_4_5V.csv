@@ -1,0 +1,7 @@
+channel,frequency,amplitude,offset,phase,waveform_type
+1,0.0,20.0,0.0,0.0,SINE
+2,0.0,20.0,0.0,0.0,SINE
+3,0.0,20.0,0.0,0.0,SINE
+1,0.0,20.0,0.0,0.0,SINE
+2,0.0,20.0,0.0,0.0,SINE
+3,0.0,20.0,0.0,0.0,SINE
