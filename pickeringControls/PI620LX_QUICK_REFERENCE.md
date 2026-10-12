@@ -2,9 +2,10 @@
 
 Raw vendor-package calls needed to connect to the LXI cabinet and drive a
 41-620 function generator card directly, without going through
+the (now archived — see `archive/pickeringControls/`)
 `pickeringInterfaceV2.pickeringHeader`. For ad-hoc bench testing/debugging
-only — `groundController.py` still uses `pickeringHeader` for normal
-operation.
+only — `groundController.py` no longer uses `pickeringHeader` either; it
+calls `pilxi`/`pi620lx` directly, the same way this doc describes.
 
 Both packages live under `pickeringControls/pilxi-5.7/` — `pilxi` (LXI
 session, relay card) and `pi620lx` (41-620 function generator cards). Treat
@@ -205,6 +206,6 @@ flag does not appear to prevent output from starting; the programmed
 frequency has been observed stuck at ~2.5kHz regardless of the requested
 value; and amplitude has been observed capped near ~22mV regardless of the
 requested dB/volts. Root cause unconfirmed — under active investigation with
-raw pi620lx calls (bypassing `pickeringHeader`) to isolate whether this is a
+raw pi620lx calls (bypassing the archived `pickeringHeader`) to isolate whether this is a
 wrapper bug, a channel-indexing mismatch, or a genuine hardware/firmware
 limit.

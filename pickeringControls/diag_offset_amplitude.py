@@ -2,7 +2,7 @@
 wrong-amplitude bug (reported 2026-07-30: 5V amplitude + 4.5V offset at
 10kHz measured as ~2.8V amplitude with no DC offset on the scope).
 
-Drives pilxi/pi620lx directly — no pickeringHeader — one step at a time,
+Drives pilxi/pi620lx directly — no pickeringHeader (archived) — one step at a time,
 with input() pauses, so a scope can be checked at each stage. Only exercises
 channel 1 of the first card, free-running (CONT trigger) so no relay pulse
 is needed to see output — this isolates amplitude/offset from the separate

@@ -2,8 +2,8 @@ Author(s): Braedon Larsen
 Created 6.11.26
 Updated: 7.17.26 — switched from pilxi's generic PIFGLX_* card interface to
 the vendor-supplied pi620lx wrapper (Pickering support confirmed this is the
-correct methodology for the 41-620 cards in this chassis; see `test01` in
-this directory, the sample script they provided). pilxi is still used to open
+correct methodology for the 41-620 cards in this chassis; see `test01.py` in
+`archive/pickeringControls/`, the sample script they provided). pilxi is still used to open
 the LXI session itself, but no PIFGLX_* calls or Pi_Session.OpenCard() calls
 are made anymore.
 
@@ -26,9 +26,9 @@ pi620lx.Card also has no CardId()/CardLoc() — card identity for logging/health
     - RETURNS - None
     - Sequence: setActiveChannel → outputOff → setTriggerMode(FRONT, CONT) → setOutputOffsetVoltage → setAttenuation → generateSignal(..., generate=False) → outputOn.
     - **Unit/semantic changes from the old pilxi-based version:**
-      - `frequency` on waveAtributes is still Hz; updateWaveform() converts it to kHz before calling `card.generateSignal()`, per test01's convention. This conversion is trusted from the sample script's comment, not independently verified against the driver — worth confirming against real hardware.
+      - `frequency` on waveAtributes is still Hz; updateWaveform() converts it to kHz before calling `card.generateSignal()`, per `archive/pickeringControls/test01.py`'s convention. This conversion is trusted from the sample script's comment, not independently verified against the driver — worth confirming against real hardware.
       - `amplitude` is now **dB of attenuation** (`card.setAttenuation()`), not a target voltage — pi620lx's documented workflow has no direct "set amplitude in volts" call. Any existing CSV configs written under the old volts-based semantics need their `amplitude` column values reinterpreted/redone as dB.
-      - `offset` is a voltage in the range **-5 to 5V** (`card.setOutputOffsetVoltage()`) — the old range check was 0-5V, which was a bug relative to test01's documented -5 to 5V range; this is now fixed.
+      - `offset` is a voltage in the range **-5 to 5V** (`card.setOutputOffsetVoltage()`) — the old range check was 0-5V, which was a bug relative to `test01.py`'s (archived) documented -5 to 5V range; this is now fixed.
       - `symmetry` (0-100) is a new waveAtributes field, required by `card.generateSignal()`. Defaults to 50 if not set; the CSV loader (`readConfigs()`) treats it as an optional column, also defaulting to 50 when absent.
       - Waveform types: only SINE (0), TRIANGLE (1), SQUARE (2) are supported (`pi620lx.Card.signalShapes`) — note TRIANGLE/SQUARE are swapped relative to the old `pilxi.WaveformTypes` enum values. RAMP/DC/PULSE/PWM/ARB have no pi620lx equivalent and are no longer supported; an unrecognized/unsupported `waveform_type` in a CSV falls back to SINE.
 

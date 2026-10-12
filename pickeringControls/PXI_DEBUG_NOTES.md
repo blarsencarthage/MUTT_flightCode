@@ -1,5 +1,12 @@
 # PXI/Pickering Debugging Session — 2026-07-17
 
+> **Archive note (2026-10-11):** several files this log refers to were moved
+> to `archive/pickeringControls/` (original filenames kept): `test01.py`,
+> `pickeringInterfaceV2.py`, `pickeringInterfaceV2_README.md`,
+> `diag_arm_trigger.py`, `claudeController.py`, `GT_PickeringTest.py`,
+> `REPL_ConnectionCode.py`, `ObjPickeringInterface.py`. Paths below are
+> historical and left as written.
+
 Notes from a debugging session on the "function generators aren't starting" issue,
 covering root causes found and fixed, and what's still open. Read this before
 re-investigating PXI connection issues — several of these look similar on the
@@ -364,7 +371,7 @@ signal is actually present.
 **Investigation, in order:**
 
 1. **Compared call order against the vendor's own reference example**
-   (`pickeringControls/py620_v0.1/Examples/Example_SimpleGenerate.py`), which
+   (`pickeringControls/pilxi-5.7/examples/Example_41-620_FunctionGenerator.py`), which
    calls `card.setTriggerMode(...)` *before* `card.generateSignal(...,
    generate=False)`. The current code (`sendConfigToCards()` /
    `armFuncGens()`) sets trigger mode *after* `generateSignal()`, in a

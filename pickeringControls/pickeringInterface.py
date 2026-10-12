@@ -2,7 +2,7 @@
 #Author: Braedon Larsen
 #Created: 6.11.26
 #Updated 7.17.26 — switched from pilxi's generic PIFGLX_* card interface to the
-#vendor-supplied pi620lx wrapper (see test01 in this directory, provided by
+#vendor-supplied pi620lx wrapper (see archive/pickeringControls/test01.py, provided by
 #Pickering support), which is the methodology that actually works with the
 #41-620 cards in this chassis. pilxi is still used for the LXI session itself
 #(pi620lx.Base needs a session ID from it) but no PIFGLX_* / Pi_Session.OpenCard
@@ -36,7 +36,7 @@ _WAVEFORM_TYPE_MAP = {
 }
 _WAVEFORM_TYPE_SINE = _WAVEFORM_TYPE_MAP["SINE"]
 
-# 41-620 attenuator: 0 dB = full-scale output, per py620 readme's documented
+# 41-620 attenuator: 0 dB = full-scale output, per pi620lx's documented
 # 0-40 dB attenuation range. Full-scale output is 20 Vpp — used to convert a
 # target volts amplitude into the dB attenuation card.setAttenuation() wants.
 _FULL_SCALE_VOLTS = 20.0
@@ -63,7 +63,7 @@ def _cardLabel(card):
 class waveAtributes:
     """Stores all parameters that describe a single waveform channel output.
 
-    NOTE on units (pi620lx methodology, see test01 in this directory):
+    NOTE on units (pi620lx methodology, see archive/pickeringControls/test01.py):
       - frequency is stored in Hz (same as before) but is converted to kHz
         by updateWaveform() before being passed to card.generateSignal(),
         which expects kHz.
@@ -241,8 +241,8 @@ def initPXIE(ip_address="pxi", timeout=5000):
     timeout (ms) is the TCP connect timeout — the default pilxi value (1000ms)
     is too short for a chassis that is still booting.
 
-    Card discovery and control go through pi620lx (see test01 in this
-    directory), which is 41-620-specific: pi620lx.Base.findCards() only ever
+    Card discovery and control go through pi620lx (see
+    archive/pickeringControls/test01.py), which is 41-620-specific: pi620lx.Base.findCards() only ever
     returns 41-620 function generator cards, so — unlike the old
     pilxi.Pi_Session.FindFreeCards() approach — there is no need to guess
     whether a found card is actually a function generator, and no separate

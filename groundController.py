@@ -8,7 +8,7 @@
 # All controls connect to real hardware (PXI, relay board, RS-422 serial).
 #
 # PXI/function-generator control talks to pi620lx/pilxi directly (no
-# pickeringInterfaceV2/pickeringHeader abstraction) — same configure-then-
+# pickeringHeader abstraction — archived in archive/pickeringControls/) — same configure-then-
 # outputOn() methodology as pickeringControls/pickeringConnector.py. There is
 # no arm/trigger split and no background auto-reconnect thread; a channel's
 # Apply configures it and immediately calls outputOn(), after which it either
@@ -38,7 +38,7 @@ import pi620lx
 from relayControls.relaySerial import RelayController
 import serial
 
-# 41-620 attenuator: 0 dB = full-scale output, per py620 readme's documented
+# 41-620 attenuator: 0 dB = full-scale output, per pi620lx's documented
 # 0-40 dB attenuation range. Full-scale output is 10 Vpp, open circuit —
 # Pickering_FuncGenManual.pdf Section 1's "Waveform Signal" spec (the
 # previous 20 Vpp value here was wrong and halved every commanded
@@ -61,7 +61,7 @@ def _dbFromVolts(volts):
 # frequencyStepTime_ms pair (per Pickering_FuncGenManual.pdf §4), not a rate —
 # SweepModeWindow exposes a single Hz/s "rate" dial instead, and this fixed
 # step time is what that rate gets converted against (stepSizeKHz = rate *
-# stepTime_s / 1000). 5ms matches pickeringControls/REPL_ConnectionCode.py's
+# stepTime_s / 1000). 5ms matches archive/pickeringControls/REPL_ConnectionCode.py's
 # confirmed-working value on the actual hardware — the driver rejected
 # coarser step times (e.g. 1000ms) when that was tried.
 _SWEEP_STEP_TIME_MS = 5.0
@@ -83,7 +83,7 @@ CHANNEL_MAP = {
 }
 
 # 40-115 relay card (pxiRelayCard) subunit/bit wired to the FG cards' external
-# FRONT trigger input. 1-based, matching the old pickeringInterfaceV2.py's
+# FRONT trigger input. 1-based, matching the old (archived) pickeringInterfaceV2.py's
 # convention. Firing pulses this closed for _TRIGGER_RELAY_PULSE_S seconds
 # then reopens it — entirely separate from applying/stopping channels.
 _TRIGGER_RELAY_SUBUNIT = 1
@@ -270,6 +270,7 @@ relayErrors:    list          = []   # timestamped relay error strings (newest l
 _relayManagerWindow = None           # singleton Toplevel reference
 _manualModeWindow = None             # singleton Toplevel reference
 _sweepModeWindow = None              # singleton Toplevel reference
+_demoModeWindow = None               # singleton Toplevel reference
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ERROR LOG HELPERS
@@ -418,8 +419,8 @@ def _applyPxiChannel(pair_idx, freq, amp, offset, phase, trig_mode_name):
                     f"amp={amp:.3f}V offset={offset:.3f}V phase={phase:.1f}° "
                     f"— output on ({trig_mode_name})")
             except Exception as e:
-                logMsg("ERROR", f"PXI apply pair {pair_idx+1}: {e}")
-                _lxi_append_error(f"apply pair {pair_idx+1}: {e}")
+                logMsg("ERROR", f"PXI apply pair {pair_idx+1}: {e!r}")
+                _lxi_append_error(f"apply pair {pair_idx+1}: {e!r}")
         else:
             logMsg("WARNING",
                 f"PXI pair {pair_idx+1}: card {card_idx} not available "
@@ -474,8 +475,8 @@ def _applyPxiSweepChannel(pair_idx, minFreq, maxFreq, rateHzPerSec, amp, offset)
                     f"rate={rateHzPerSec:.0f}Hz/s amp={amp:.3f}V offset={offset:.3f}V "
                     f"— armed, waiting on trigger")
             except Exception as e:
-                logMsg("ERROR", f"PXI sweep apply pair {pair_idx+1}: {e}")
-                _lxi_append_error(f"sweep apply pair {pair_idx+1}: {e}")
+                logMsg("ERROR", f"PXI sweep apply pair {pair_idx+1}: {e!r}")
+                _lxi_append_error(f"sweep apply pair {pair_idx+1}: {e!r}")
         else:
             logMsg("WARNING",
                 f"PXI pair {pair_idx+1}: card {card_idx} not available "
@@ -494,7 +495,7 @@ def pxi_worker():
     external FRONT trigger depending on physical wiring.
 
     "apply_freerun" sets CONT trigger mode instead (pi620lx's "continuous"
-    mode, 0x6 — the same mode pickeringInterfaceV2 v1 used, which is why v1
+    mode, 0x6 — the same mode pickeringInterface.py (v1) uses, which is why v1
     channels always started running immediately on Apply with no cross-
     channel phase sync). CONT ignores the trigger line entirely, so
     outputOn() always starts the channel generating right away. Used
@@ -547,8 +548,8 @@ def pxi_worker():
                         card.setActiveChannel(ch_num)
                         card.outputOff()
                     except Exception as e:
-                        logMsg("ERROR", f"PXI stop pair {pair_idx+1}: {e}")
-                        _lxi_append_error(f"stop pair {pair_idx+1}: {e}")
+                        logMsg("ERROR", f"PXI stop pair {pair_idx+1}: {e!r}")
+                        _lxi_append_error(f"stop pair {pair_idx+1}: {e!r}")
                 if pxiChannelState[pair_idx] is not None:
                     pxiChannelState[pair_idx]["status"] = "IDLE"
                     _notifyPair(pair_idx, pxiChannelState[pair_idx])
@@ -585,8 +586,8 @@ def pxi_worker():
                         pxiRelayCard.OpBit(_TRIGGER_RELAY_SUBUNIT, _TRIGGER_RELAY_BIT, False)
                         logMsg("INFO", "PXI relay: reopened")
                     except Exception as e:
-                        logMsg("ERROR", f"PXI relay fire failed: {e}")
-                        _lxi_append_error(f"relay fire failed: {e}")
+                        logMsg("ERROR", f"PXI relay fire failed: {e!r}")
+                        _lxi_append_error(f"relay fire failed: {e!r}")
                 else:
                     logMsg("WARNING", "PXI relay fire ignored: no relay card found")
 
@@ -753,7 +754,7 @@ def restartThread(name):
 def _openPXI():
     """One-shot connect + card discovery, mirroring pickeringConnector.py's
     session/base/findCards/openCard sequence exactly. The 40-115 relay card
-    (if present) is found the same way pickeringInterfaceV2 used to (scan
+    (if present) is found the same way the archived pickeringInterfaceV2 did (scan
     session.FindFreeCards(), match CardId()) but is only stored — nothing
     currently wires it into arm/trigger, since pickeringConnector.py's
     methodology doesn't use it. Raises on failure; caller decides how to log
@@ -817,7 +818,7 @@ def reinitPXI(force=False):
             try:
                 pxiSession.Close()
             except Exception as e:
-                logMsg("ERROR", f"PXI reinit: error closing previous session: {e}")
+                logMsg("ERROR", f"PXI reinit: error closing previous session: {e!r}")
         pxiSession = None
         pxiCards = []
         pxiRelayCard = None
@@ -828,8 +829,8 @@ def reinitPXI(force=False):
             logMsg("INFO", f"PXI reinit: connected to {PXI_IP}, "
                             f"{len(pxiCards)} card(s) found")
         except Exception as e:
-            logMsg("ERROR", f"PXI reinit failed: {e}")
-            _lxi_append_error(f"reinit failed: {e}")
+            logMsg("ERROR", f"PXI reinit failed: {e!r}")
+            _lxi_append_error(f"reinit failed: {e!r}")
 
 
 def _reconnect_relay(new_port: str) -> None:
@@ -1041,9 +1042,9 @@ def initHardware():
                                f"(already claimed by another session?)")
             errors.append("PXI: 0 cards found")
     except Exception as e:
-        logMsg("ERROR", f"PXI init failed: {e}")
-        _lxi_append_error(f"startup init failed (IP {PXI_IP}): {e}")
-        errors.append(f"PXI: {e}")
+        logMsg("ERROR", f"PXI init failed: {e!r}")
+        _lxi_append_error(f"startup init failed (IP {PXI_IP}): {e!r}")
+        errors.append(f"PXI: {e!r}")
 
     try:
         relayController = RelayController(port=RELAY_PORT)
@@ -1327,7 +1328,12 @@ class PairControls(tk.Frame):
         """Set var + slider + entry together, widening the slider's range if
         the value falls outside its normal display bounds. Without this, a
         tk.Scale silently clamps its linked variable back within from_/to,
-        which would corrupt the value actually sent to hardware."""
+        which would corrupt the value actually sent to hardware.
+
+        Entry writes are wrapped in a normal/disabled toggle because Tk
+        raises TclError on .insert()/.delete() against a disabled Entry —
+        apply_param() (called by Manual/Sweep/Demo Mode while this pair's
+        controls are locked, see set_locked()) would otherwise throw."""
         scale = self._scales[key]
         sl_min, sl_max = self._sl_bounds[key]
         if val < sl_min or val > sl_max:
@@ -1336,8 +1342,13 @@ class PairControls(tk.Frame):
             scale.configure(from_=sl_min, to=sl_max)
         self._vars[key].set(val)
         entry, _, _, _ = self._entries[key]
+        was_disabled = entry.cget("state") == "disabled"
+        if was_disabled:
+            entry.configure(state="normal")
         entry.delete(0, "end")
         entry.insert(0, format(val, fmt))
+        if was_disabled:
+            entry.configure(state="disabled")
 
     def _on_disable_toggle(self):
         disabled = self._disabled_var.get()
@@ -1346,7 +1357,16 @@ class PairControls(tk.Frame):
             queuePxiStopPair(self._idx)
 
     def _apply(self, freerun=False):
-        if self._disabled_var.get() or self._locked:
+        """Only the Disable checkbox gates this — self._locked is
+        deliberately NOT checked here. The Apply button/sliders/entries are
+        already disabled at the Tk level while locked (see
+        _refresh_lock_state()), which is what stops the *operator* from
+        triggering this via the UI; Manual/Sweep/Demo Mode are the ones
+        driving apply()/apply_param() programmatically while locked (that's
+        the whole point of locking — this window now owns the array), so
+        gating on self._locked here would silently block exactly the callers
+        set_locked(True) exists to allow."""
+        if self._disabled_var.get():
             return
         if self._on_focus:
             self._on_focus(self._idx)
@@ -1576,20 +1596,17 @@ class LXIManagerWindow(tk.Toplevel):
         if not self.winfo_exists():
             return
 
-        # Connection status derived from the raw pxiSession/pxiCards globals directly
-        with pxiLock:
-            connected = pxiConnected
-            n_cards = len(pxiCards)
-            has_relay = pxiRelayCard is not None
-        if connected:
-            self._status_dot.config(fg=GREEN)
-            self._status_lbl.config(text="CONNECTED", fg=GREEN)
-        else:
-            self._status_dot.config(fg=RED)
-            self._status_lbl.config(text="OFFLINE", fg=RED)
-        self._info_lbl.config(
-            text=f"Cards: {n_cards}  |  Relay: {'found' if has_relay else 'missing'}  |  "
-                 f"Reinit count: {pxiReinitCount}  |  IP: {PXI_IP}")
+        # Connection status derived from the raw pxiSession/pxiCards globals —
+        # fetched in a background thread, NOT here. pxiLock can be held for an
+        # unbounded time by pxi_worker if a pi620lx driver call hangs (no
+        # per-call timeout exists on any of them — see PXI_DEBUG_NOTES.md);
+        # this refresh loop runs via self.after() on the Tk main thread, so
+        # acquiring pxiLock directly here would freeze the *entire* GUI (every
+        # window, not just PXI controls) for as long as that hang lasts —
+        # confirmed as the actual crash mechanism behind a 2026-08-04 "Demo
+        # Mode audible sweep freezes the app" report.
+        threading.Thread(target=self._fetch_status, daemon=True).start()
+
         if self.focus_get() is not self._ip_entry:
             self._ip_var.set(PXI_IP)
 
@@ -1607,6 +1624,28 @@ class LXIManagerWindow(tk.Toplevel):
             self._error_shown_count = len(lxiErrors)
 
         self.after(2000, self._refresh)
+
+    def _fetch_status(self):
+        """Runs on a background thread — see _refresh()'s docstring for why
+        pxiLock must never be taken from the Tk main thread here."""
+        with pxiLock:
+            connected = pxiConnected
+            n_cards = len(pxiCards)
+            has_relay = pxiRelayCard is not None
+        self.after(0, self._apply_status, connected, n_cards, has_relay)
+
+    def _apply_status(self, connected, n_cards, has_relay):
+        if not self.winfo_exists():
+            return
+        if connected:
+            self._status_dot.config(fg=GREEN)
+            self._status_lbl.config(text="CONNECTED", fg=GREEN)
+        else:
+            self._status_dot.config(fg=RED)
+            self._status_lbl.config(text="OFFLINE", fg=RED)
+        self._info_lbl.config(
+            text=f"Cards: {n_cards}  |  Relay: {'found' if has_relay else 'missing'}  |  "
+                 f"Reinit count: {pxiReinitCount}  |  IP: {PXI_IP}")
 
     def _fetch_card_info(self):
         """Gather card bus/device identity (runs in background thread).
@@ -1949,6 +1988,24 @@ SWEEP_PARAMS = [
     ("rate",    "Sweep Rate (Hz/s)",    0.0,   500_000.0, 10_000.0, ".0f", 5_000.0),
     ("amp",     "Amplitude (V)",        0.0,        20.0,     10.0, ".3f",     1.0),
     ("offset",  "Offset (V)",           0.0,         5.0,      0.0, ".3f",     0.5),
+]
+
+# ── DEMO MODE presets ──────────────────────────────────────────────────────
+# Fixed values for DemoModeWindow's single-channel buttons and the canned
+# audible-sweep preset (both per the operator's spec — see DemoModeWindow's
+# docstring). DEMO_CUSTOM_SWEEP_PARAMS mirrors SWEEP_PARAMS's shape but seeds
+# its DialControls at the same 8-12kHz/5.5V/3V starting point as the audible
+# preset, since the custom panel is meant to be a quick variation on it.
+DEMO_SINGLE_CHANNEL_PRESET = {"freq": 10_000.0, "amp": 5.5, "offset": 3.0}
+DEMO_AUDIBLE_SWEEP_PRESET = {
+    "minFreq": 8_000.0, "maxFreq": 12_000.0, "rate": 2_000.0, "amp": 5.5, "offset": 3.0,
+}
+DEMO_CUSTOM_SWEEP_PARAMS = [
+    ("minFreq", "Min Frequency (Hz)", 100.0, 1_000_000.0,  8_000.0, ".0f", 2_000.0),
+    ("maxFreq", "Max Frequency (Hz)", 100.0, 1_000_000.0, 12_000.0, ".0f", 2_000.0),
+    ("rate",    "Sweep Rate (Hz/s)",    0.0,   500_000.0,  2_000.0, ".0f", 1_000.0),
+    ("amp",     "Amplitude (V)",        0.0,        20.0,      5.5, ".3f",     1.0),
+    ("offset",  "Offset (V)",           0.0,         5.0,      3.0, ".3f",     0.5),
 ]
 
 
@@ -2571,6 +2628,186 @@ class SweepModeWindow(tk.Toplevel):
         self.destroy()
 
 
+class DemoModeWindow(tk.Toplevel):
+    """Standalone window for showing off the array to visitors — three canned
+    shortcuts instead of dialing anything in by hand:
+
+    1. Six "Pair N" buttons, one per channel, each freerun-engaging
+       (CONT trigger mode, same as Manual Mode — see pxi_worker's docstring)
+       that single channel at a fixed 10kHz/5.5V/3V-offset tone. These
+       don't care about the trigger at all, so pressing one is immediate.
+
+    2. An "Audible Sweep" preset (8-12kHz, 5.5V, 3V offset, 2000Hz/s —
+       DEMO_AUDIBLE_SWEEP_PRESET) that Arms all six channels the same way
+       SweepModeWindow does: POSEDGE/FRONT-trigger-gated, staged but not
+       generating until the trigger fires.
+
+    3. A smaller custom sweep panel (DEMO_CUSTOM_SWEEP_PARAMS) — the same
+       DialControl-driven min/max/rate/amp/offset controls as full Sweep
+       Mode, for demoing a different band without leaving this window.
+
+    Both sweep sections share this window's single Fire Trigger button,
+    since firing is a single relay pulse global to the array — mirrors how
+    SweepModeWindow's own Fire Trigger works.
+
+    Opening this window locks the main window's per-pair and ring/global
+    controls (via app._set_array_controls_locked), same as Manual/Sweep
+    Mode, so nothing else can fight over the same channels mid-demo. Stop
+    All kills every pair immediately without closing the window.
+    """
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._app = app
+        self.title("Demo Mode — Presentation Shortcuts")
+        self.configure(bg=BG)
+        self.minsize(620, 700)
+        self.resizable(True, True)
+
+        self._sweep_dials = {}      # key -> DialControl (custom sweep panel)
+        self._touched_pairs = set() # pair indices this window has driven — see _on_close()
+
+        app._set_array_controls_locked(True)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._build_ui()
+
+    # ── UI construction ───────────────────────────────────────────────────
+
+    def _build_ui(self):
+        warn = tk.Label(self, bg=BG, fg=YELLOW, font=("Helvetica", 8, "italic"),
+                 text="Demo Mode owns the array — per-pair and ring/global "
+                      "controls on the main window are locked while this is open.",
+                 wraplength=580, justify="left")
+        warn.pack(fill="x", padx=10, pady=(8, 4))
+
+        # ── single-channel buttons ──────────────────────────────────────
+        single_frame = tk.LabelFrame(
+            self, text="Single Channel — 10kHz / 5.5V / 3V offset (freerun)",
+            bg=BG, fg=FG, font=("Helvetica", 9, "bold"), padx=8, pady=6)
+        single_frame.pack(fill="x", padx=10, pady=4)
+        for p in range(NUM_PAIRS):
+            card_idx, ch_num = CHANNEL_MAP[p]
+            btn = tk.Button(
+                single_frame, text=f"Pair {p + 1}\nCard {card_idx + 1} Ch {ch_num}",
+                bg=BG_HL, fg=PAIR_COLORS[p], relief="flat",
+                padx=8, pady=6, font=("Helvetica", 9, "bold"),
+                activebackground=PAIR_COLORS[p], activeforeground=BG,
+                command=lambda idx=p: self._engage_single(idx))
+            btn.grid(row=0, column=p, padx=4, pady=2, sticky="ew")
+            single_frame.columnconfigure(p, weight=1)
+
+        # ── audible sweep preset ────────────────────────────────────────
+        audible_frame = tk.LabelFrame(
+            self, text="Audible Sweep — 8kHz‒12kHz / 5.5V / 3V offset / 2000Hz/s",
+            bg=BG, fg=FG, font=("Helvetica", 9, "bold"), padx=8, pady=6)
+        audible_frame.pack(fill="x", padx=10, pady=4)
+        tk.Button(audible_frame, text="Arm All Channels", bg=BG_HL, fg=GREEN,
+                  relief="flat", padx=12, pady=5, font=("Helvetica", 9, "bold"),
+                  activebackground=GREEN, activeforeground=BG,
+                  command=self._arm_audible_sweep).pack(side="left", padx=(0, 10))
+
+        # ── custom sweep panel ──────────────────────────────────────────
+        custom_frame = tk.LabelFrame(
+            self, text="Custom Sweep — All Channels",
+            bg=BG, fg=FG, font=("Helvetica", 9, "bold"), padx=10, pady=8)
+        custom_frame.pack(fill="x", padx=10, pady=4)
+        for key, label, lo, hi, default, fmt, fine_span in DEMO_CUSTOM_SWEEP_PARAMS:
+            dial = DialControl(custom_frame, label, lo, hi, default, fmt, fine_span,
+                               on_commit=None)
+            dial.pack(fill="x", pady=(0, 10))
+            self._sweep_dials[key] = dial
+        tk.Button(custom_frame, text="Arm All Channels", bg=BG_HL, fg=GREEN,
+                  relief="flat", padx=12, pady=5, font=("Helvetica", 9, "bold"),
+                  activebackground=GREEN, activeforeground=BG,
+                  command=self._arm_custom_sweep).pack(anchor="w")
+
+        # ── shared trigger / stop ───────────────────────────────────────
+        action = tk.Frame(self, bg=BG)
+        action.pack(fill="x", padx=10, pady=(4, 4))
+        tk.Button(action, text="Fire Trigger", bg=BG_HL, fg=YELLOW, relief="flat",
+                  padx=12, pady=5, font=("Helvetica", 9, "bold"),
+                  activebackground=YELLOW, activeforeground=BG,
+                  command=self._fire_relay).pack(side="left", padx=(0, 10))
+        tk.Button(action, text="Stop All", bg=BG_HL, fg=RED, relief="flat",
+                  padx=12, pady=5, font=("Helvetica", 9, "bold"),
+                  activebackground=RED, activeforeground=BG,
+                  command=self._stop_all).pack(side="left", padx=(0, 10))
+
+        tk.Button(self, text="Close", bg=BG_HL, fg=FG, relief="flat",
+                  padx=12, pady=4, activebackground="#4e4e70", activeforeground=FG,
+                  command=self._on_close).pack(pady=(4, 8))
+
+    # ── single-channel buttons ────────────────────────────────────────────
+
+    def _engage_single(self, pair_idx):
+        """Freerun-engage one pair at the fixed demo preset — immediate,
+        no trigger involved (mirrors ManualModeWindow's ENGAGE path)."""
+        ctrl = self._app._pair_controls[pair_idx]
+        if ctrl.is_disabled():
+            logMsg("WARNING", f"Demo Mode: pair {pair_idx + 1} is disabled — skipped")
+            return
+        ctrl.apply_param("freq", DEMO_SINGLE_CHANNEL_PRESET["freq"])
+        ctrl.apply_param("amp", DEMO_SINGLE_CHANNEL_PRESET["amp"])
+        ctrl.apply_param("offset", DEMO_SINGLE_CHANNEL_PRESET["offset"])
+        ctrl.apply(freerun=True)
+        self._touched_pairs.add(pair_idx)
+        logMsg("INFO", f"Demo Mode: pair {pair_idx + 1} engaged at 10kHz/5.5V/3V offset")
+
+    # ── sweep arming (shared trigger) ─────────────────────────────────────
+
+    def _arm_audible_sweep(self):
+        preset = DEMO_AUDIBLE_SWEEP_PRESET
+        self._arm_sweep_all(preset["minFreq"], preset["maxFreq"], preset["rate"],
+                            preset["amp"], preset["offset"])
+        logMsg("INFO", "Demo Mode: audible sweep (8-12kHz) armed — waiting on trigger")
+
+    def _arm_custom_sweep(self):
+        minFreq = self._sweep_dials["minFreq"].get()
+        maxFreq = self._sweep_dials["maxFreq"].get()
+        rate = self._sweep_dials["rate"].get()
+        amp = self._sweep_dials["amp"].get()
+        offset = self._sweep_dials["offset"].get()
+        if maxFreq < minFreq:
+            logMsg("WARNING", "Demo Mode: max frequency is below min frequency — swap them")
+            return
+        self._arm_sweep_all(minFreq, maxFreq, rate, amp, offset)
+        logMsg("INFO",
+            f"Demo Mode: custom sweep armed {minFreq:.0f}-{maxFreq:.0f}Hz "
+            f"@ {rate:.0f}Hz/s — waiting on trigger")
+
+    def _arm_sweep_all(self, minFreq, maxFreq, rate, amp, offset):
+        for idx in range(NUM_PAIRS):
+            ctrl = self._app._pair_controls[idx]
+            if ctrl.is_disabled():
+                continue
+            queuePxiApplySweep(idx, minFreq, maxFreq, rate, amp, offset)
+            self._touched_pairs.add(idx)
+
+    def _fire_relay(self):
+        pxiQueue.put(("fire_relay",))
+
+    def _stop_all(self):
+        queuePxiStopAll()
+        logMsg("INFO", "Demo Mode: stop all")
+
+    # ── shutdown ──────────────────────────────────────────────────────────
+
+    def _on_close(self):
+        """Turns off every pair this window touched, then restores each back
+        to whatever its PairControls currently show (ordinary Apply,
+        freerun=False) — same restore-on-close behavior as Sweep Mode, so
+        Demo Mode never leaves a channel generating or silently stuck armed
+        after the window closes."""
+        for idx in sorted(self._touched_pairs):
+            ctrl = self._app._pair_controls[idx]
+            if not ctrl.is_disabled():
+                queuePxiStopPair(idx)
+                ctrl.apply(freerun=False)
+        self._app._set_array_controls_locked(False)
+        self.destroy()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN APPLICATION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2728,6 +2965,10 @@ class GroundControllerApp(tk.Tk):
                   padx=12, pady=5,
                   activebackground=BLUE, activeforeground=BG,
                   command=self._open_sweep_mode).pack(side="left", padx=(0, 10))
+        tk.Button(action, text="Demo Mode…", bg=BG_HL, fg=GREEN, relief="flat",
+                  padx=12, pady=5,
+                  activebackground=GREEN, activeforeground=BG,
+                  command=self._open_demo_mode).pack(side="left", padx=(0, 10))
 
         # LXI channel table
         lxi_frame = tk.LabelFrame(content, text="LXI Function Generators",
@@ -3072,6 +3313,14 @@ class GroundControllerApp(tk.Tk):
             _sweepModeWindow.focus_force()
         else:
             _sweepModeWindow = SweepModeWindow(self)
+
+    def _open_demo_mode(self):
+        global _demoModeWindow
+        if _demoModeWindow is not None and _demoModeWindow.winfo_exists():
+            _demoModeWindow.lift()
+            _demoModeWindow.focus_force()
+        else:
+            _demoModeWindow = DemoModeWindow(self)
 
     def _set_array_controls_locked(self, locked):
         """Grey out (without stopping) every per-pair and ring/global control
